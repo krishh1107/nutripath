@@ -6,7 +6,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const db = require('./db');
 const auth = require('./auth');
 const mailer = require('./mailer');
-const { FOODS, RECIPES, SUPPLEMENTS, SUPPLEMENT_WARNINGS } = require('./data');
+const { FOODS, SUPPLEMENTS, SUPPLEMENT_WARNINGS } = require('./data');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -76,17 +76,41 @@ app.post('/api/auth/login', h(async (req, res) => {
 }));
 
 // Demo sign-in (only when Firebase is not configured, or ALLOW_DEMO_LOGIN=true)
-app.post('/api/auth/demo', async (req, res) => {
+async function demoLogin(req, res) {
   if (!auth.demoLoginEnabled) return res.status(403).json({ error: 'Demo sign-in is disabled — use Google sign-in.' });
   const name = String(req.body?.name || '').trim().slice(0, 60);
   const email = String(req.body?.email || '').trim().toLowerCase().slice(0, 200);
-  if (!name) return res.status(400).json({ error: 'Name is required' });
+  if (!name && !email) return res.status(400).json({ error: 'Name is required' });
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Email looks invalid' });
+  let result;
+  try {
+    result = await db.upsertUser({
+      firebase_uid: `demo:${email || name.toLowerCase()}`, email: email || null, name: name || email.split('@')[0], provider: 'demo',
+    });
+  } catch (err) {
+    console.error('[login] user upsert failed:', db.describeError(err));
+    return res.status(503).json({ error: 'Could not save your account — the database is unreachable. Try again shortly.' });
+  }
+  res.json(sessionPayload(result.user, result.isNew));
+}
+app.post('/api/auth/demo', h(demoLogin));
+
+// Unified login: { idToken } → Google/Firebase sign-in, otherwise { name, email } → demo sign-in.
+// Inserts the users row on first login and returns { token, user, isNew, needsOnboarding }.
+app.post('/api/login', h(async (req, res) => {
+  if (!req.body?.idToken) return demoLogin(req, res);
+  let claims;
+  try {
+    claims = await auth.verifyFirebaseIdToken(req.body.idToken);
+  } catch (err) {
+    return res.status(401).json({ error: `Sign-in failed: ${err.message}` });
+  }
   const { user, isNew } = await db.upsertUser({
-    firebase_uid: `demo:${email || name.toLowerCase()}`, email: email || null, name, provider: 'demo',
+    firebase_uid: claims.sub, email: claims.email, name: claims.name || claims.email?.split('@')[0],
+    photo_url: claims.picture, provider: 'google',
   });
   res.json(sessionPayload(user, isNew));
-});
+}));
 
 // Everything below requires a session
 app.use('/api', auth.requireAuth(db));
@@ -162,86 +186,39 @@ app.get('/api/fitness', async (req, res) => {
   res.json({
     algorithm: 'Mifflin-St Jeor', input, targets: calcTargets(input),
     options: { activity: ACTIVITY, goals: Object.keys(GOAL_ADJ) },
-    workout_fuel: buildWorkoutFuel(input),
   });
 });
 
-// Pre/Post-workout fuel timeline, scaled to body weight (ISSN timing guidance)
-function buildWorkoutFuel({ weight }) {
-  const preCarb = Math.round(weight * 1); // ~1 g/kg 1–3 h before
-  const postProtein = Math.round(Math.min(40, Math.max(20, weight * 0.3)));
-  const postCarb = Math.round(weight * 0.8);
-  return [
-    { when: '−3 to −2 h', title: 'Pre-workout meal', target: `~${preCarb} g carbs + 20 g protein, low fat & fibre`,
-      foods: ['Poha with peanuts + curd', '2 roti + dal + sabzi', 'Idli (3) + sambar'], icon: '🍛' },
-    { when: '−45 to −30 min', title: 'Top-up snack (optional)', target: 'Quick carbs, easy to digest',
-      foods: ['1 banana', '3–4 dates', 'Black coffee if you tolerate it'], icon: '🍌' },
-    { when: 'During', title: 'Hydrate', target: '150–250 ml water every 15–20 min; ORS / nimbu-pani with salt if > 60 min or very hot',
-      foods: ['Water', 'Nimbu-pani with pinch of salt', 'Coconut water'], icon: '💧' },
-    { when: '0 to +1 h', title: 'Post-workout recovery', target: `${postProtein} g protein + ~${postCarb} g carbs`,
-      foods: ['Sattu shake + banana', 'Paneer bhurji + 2 roti', '3 eggs + toast', 'Soya chunk bhel'], icon: '💪' },
-    { when: '+2 to +3 h', title: 'Balanced meal', target: 'Protein again + vegetables + complex carbs',
-      foods: ['Rajma/chole + rice + salad', 'Dal + millet roti + curd'], icon: '🥗' },
-  ];
+// ===========================================================================
+// MODULE 2. DIET PLANNER — AI meal generator · smart local swaps · hostel menu · scan & log
+// ===========================================================================
+// Gemini helper: prompt (+ optional image) → parsed JSON object
+async function geminiJSON(prompt, image = null, temperature = 0.2) {
+  const model = genAI.getGenerativeModel({ model: image ? VISION_MODEL : CHAT_MODEL, generationConfig: { responseMimeType: 'application/json', temperature } }, AI_TIMEOUT);
+  const parts = image ? [{ text: prompt }, { inlineData: image }] : [{ text: prompt }];
+  const result = await model.generateContent(parts);
+  return JSON.parse(result.response.text().replace(/^```(?:json)?|```$/g, '').trim());
 }
 
-// ===========================================================================
-// MODULE 2. DIET PLANNER — meal plans, hostel optimizer, local swaps, chai timer
-// ===========================================================================
-// Rough carb/fat split for plan items that only list kcal + protein (fat ≈ 28% kcal)
-const estimateMacros = (kcal, protein_g) => {
-  const fat_g = Math.round((kcal * 0.28) / 9);
-  return { kcal, protein_g, fat_g, carbs_g: Math.max(0, Math.round((kcal - protein_g * 4 - fat_g * 9) / 4)) };
-};
+// Validates a base64 image data URL from the client → { mimeType, data } or { error, status }
+function parseImage(body) {
+  const raw = String(body?.image || '');
+  const m = /^data:(image\/(?:jpeg|png|webp|heic|heif));base64,(.+)$/i.exec(raw);
+  const mimeType = m ? m[1].toLowerCase() : String(body?.mimeType || 'image/jpeg');
+  const data = m ? m[2] : raw;
+  if (!data || data.length < 100 || !/^[A-Za-z0-9+/=\s]+$/.test(data.slice(0, 200))) return { error: 'image must be a base64 data URL', status: 400 };
+  if (!/^image\/(jpeg|png|webp|heic|heif)$/.test(mimeType)) return { error: 'Unsupported image type', status: 400 };
+  if (data.length > 7_000_000) return { error: 'Image too large (max ~5 MB)', status: 413 };
+  return { mimeType, data };
+}
 
-const MEAL_PLANS = {
-  protein_balance: {
-    title: 'Fix the 80% Carb Plate',
-    problem: 'Typical Indian thali is ~80% carbs (rice/roti) with very little protein.',
-    rule: 'Half plate sabzi, quarter dal/paneer/egg, quarter rice/roti.',
-    meals: [
-      { slot: 'Breakfast', items: ['Moong dal chilla (2) with paneer stuffing', 'Curd (1 bowl)'], kcal: 420, protein_g: 26 },
-      { slot: 'Lunch', items: ['2 roti (not 4)', 'Rajma (1.5 katori)', 'Cucumber raita', 'Salad'], kcal: 560, protein_g: 24 },
-      { slot: 'Snack', items: ['Roasted chana (40g)', 'Buttermilk'], kcal: 220, protein_g: 12 },
-      { slot: 'Dinner', items: ['Small rice portion', 'Soya chunk curry', 'Palak sabzi'], kcal: 520, protein_g: 30 },
-    ],
-  },
-  iron_lemon_hack: {
-    title: 'Iron + Vitamin C (Lemon Hack)',
-    problem: 'Non-heme iron from plants absorbs poorly; Vitamin C boosts absorption 2–3×.',
-    rule: 'Squeeze lemon on dal/sabzi; pair iron foods with amla, guava or tomato. Keep chai/coffee 45–60 min away from meals.',
-    meals: [
-      { slot: 'Breakfast', items: ['Poha with peanuts + lemon squeeze', 'Guava (1)'], kcal: 380, protein_g: 10 },
-      { slot: 'Lunch', items: ['Palak dal + lemon', 'Bajra roti (2)', 'Kachumber salad with tomato'], kcal: 540, protein_g: 20 },
-      { slot: 'Snack', items: ['Til chikki + roasted chana', 'Amla (1) or amla juice'], kcal: 200, protein_g: 8 },
-      { slot: 'Dinner', items: ['Rajma/chole with lemon & onion', 'Rice (small)', 'Methi sabzi'], kcal: 560, protein_g: 20 },
-    ],
-  },
-  b12_omega3: {
-    title: 'Vitamin B12 & Omega-3 Repair',
-    problem: 'Vegetarians commonly lack B12 (animal-only nutrient) and EPA/DHA omega-3.',
-    rule: 'Daily dairy/eggs for B12; flaxseed/walnut/chia for ALA omega-3. Consider supplementing B12 if deficient (doctor-tested).',
-    meals: [
-      { slot: 'Breakfast', items: ['2 boiled eggs or paneer bhurji', 'Toast with flaxseed chutney'], kcal: 400, protein_g: 22 },
-      { slot: 'Lunch', items: ['Curd rice with tempering', 'Sprouts salad + walnuts'], kcal: 520, protein_g: 18 },
-      { slot: 'Snack', items: ['Milk (1 glass) with 1 tbsp chia seeds'], kcal: 220, protein_g: 10 },
-      { slot: 'Dinner', items: ['Fish curry (non-veg) OR paneer tikka', '2 roti', 'Mixed veg'], kcal: 560, protein_g: 30 },
-    ],
-  },
-};
-for (const plan of Object.values(MEAL_PLANS)) plan.meals = plan.meals.map((m) => ({ ...m, ...estimateMacros(m.kcal, m.protein_g) }));
-
+// --- Smart local swaps (reference table) ---
 const SUBSTITUTION_PAIRS = [
-  { from: 'Quinoa', to: ['Soy Chunks', 'Foxtail Millet'], why: 'Soy chunks have ~3.5× the protein of quinoa; millets match its fibre and low GI at a fraction of the cost.' },
+  { from: 'Quinoa', to: ['Foxtail Millet', 'Soy Chunks'], why: 'Millets match quinoa\'s fibre and low GI at a fraction of the cost; soy chunks have ~3.5× the protein.' },
   { from: 'Whey Protein', to: ['Sattu (Roasted Chana Flour)', 'Paneer'], why: 'Sattu gives protein + fibre for ~₹6 a glass; paneer adds casein, calcium and B12.' },
-  { from: 'Blueberries', to: ['Amla (Indian Gooseberry)', 'Guava'], why: 'One amla has more Vitamin C than a whole punnet of imported berries — and boosts iron absorption.' },
+  { from: 'Blueberries', to: ['Amla (Indian Gooseberry)', 'Guava'], why: 'One amla has more Vitamin C than a punnet of imported berries — and boosts iron absorption.' },
   { from: 'Walnuts', to: ['Flaxseed'], why: 'Ground flaxseed has ~2.5× the ALA omega-3 of walnuts at a quarter of the price.' },
 ];
-const CHAI_BLOCKER = {
-  title: 'Chai-Time Iron Blocker', minutes: 45,
-  explanation: 'Tannins (polyphenols) in tea and coffee bind non-heme iron in the gut. Chai with or right after a meal can cut iron absorption by more than half.',
-  rule: 'Wait at least 45 minutes after an iron-rich meal before chai/coffee — or have it 1 hour before eating.',
-};
 
 function buildSubstitutions() {
   const byName = Object.fromEntries(FOODS.map((f) => [f.name, f]));
@@ -253,40 +230,107 @@ function buildSubstitutions() {
   });
 }
 
-app.get('/api/diet-planner', async (req, res) => {
-  const { focus } = req.query;
-  if (focus) {
-    const plan = MEAL_PLANS[focus];
-    if (!plan) return res.status(404).json({ error: `Unknown focus. Use one of: ${Object.keys(MEAL_PLANS).join(', ')}` });
-    const total_kcal = plan.meals.reduce((s, m) => s + m.kcal, 0);
-    const total_protein_g = plan.meals.reduce((s, m) => s + m.protein_g, 0);
-    await db.saveMealPlan(req.user.id, focus, plan.meals, total_kcal);
-    return res.json({ focus, ...plan, total_kcal, total_protein_g });
-  }
-  const profile = (await db.getHealthProfile(req.user.id)) || {};
-  const kettleOnly = ['1', 'true', 'yes'].includes(String(req.query.kettle_only ?? '').toLowerCase());
-  let appliances;
-  if (kettleOnly) appliances = ['kettle'];
-  else if (req.query.appliances !== undefined) appliances = toList(req.query.appliances).filter((a) => a !== 'none');
-  else appliances = profile.appliances?.length ? profile.appliances : null;
+// --- AI single-meal generator ---
+const MEAL_OPTIONS = {
+  meal_type: ['Breakfast', 'Lunch', 'Snack', 'Dinner'],
+  cuisine: ['North Indian', 'South Indian', 'Continental'],
+  diet: ['Veg', 'Non-Veg'],
+};
+const MEAL_SHARE = { Breakfast: 0.25, Lunch: 0.35, Snack: 0.1, Dinner: 0.3 };
 
-  const recipes = RECIPES
-    .filter((r) => !appliances || r.appliance === 'none' || appliances.includes(r.appliance))
-    .sort((a, b) => b.protein_g - a.protein_g)
-    .map((r) => ({ ...r, ...estimateMacros(r.kcal, r.protein_g) }));
-  res.json({
-    plans: Object.fromEntries(Object.entries(MEAL_PLANS).map(([k, p]) => [k, {
-      ...p, focus: k, total_kcal: p.meals.reduce((s, m) => s + m.kcal, 0), total_protein_g: p.meals.reduce((s, m) => s + m.protein_g, 0),
-    }])),
-    hostel_optimizer: {
-      kettle_only: kettleOnly, appliances: appliances || ['none', 'kettle', 'induction'], recipes,
-      daily_protein_if_all: recipes.reduce((s, r) => s + Number(r.protein_g), 0),
-    },
-    mess_menu: profile.mess_menu || '',
-    substitutions: buildSubstitutions(),
-    chai_blocker: CHAI_BLOCKER,
-  });
-});
+app.get('/api/diet-planner', (req, res) => res.json({ substitutions: buildSubstitutions(), generator: MEAL_OPTIONS }));
+
+// Offline fallback pool (used only when Gemini is not configured or fails)
+const OFFLINE_MEALS = [
+  ['Breakfast', 'North Indian', 'Veg', 'Paneer-stuffed moong dal chilla', ['2 moong dal chillas', '50 g paneer', 'Mint chutney'], 380, 24, 38, 14, 6],
+  ['Breakfast', 'South Indian', 'Veg', 'Ragi dosa with sambar', ['2 ragi dosas', '1 katori sambar', 'Coconut chutney (1 tbsp)'], 360, 13, 58, 9, 9],
+  ['Breakfast', 'Continental', 'Veg', 'Overnight oats with curd, chia & banana', ['40 g oats', '150 g curd', '1 tbsp chia', '1 banana'], 390, 16, 60, 10, 9],
+  ['Breakfast', 'North Indian', 'Non-Veg', 'Masala egg bhurji with 2 multigrain roti', ['3 eggs', '2 multigrain roti', 'Onion-tomato'], 470, 27, 40, 21, 6],
+  ['Breakfast', 'South Indian', 'Non-Veg', 'Egg appam with vegetable stew', ['2 appams', '2 eggs', '1 katori veg stew'], 430, 20, 52, 15, 5],
+  ['Breakfast', 'Continental', 'Non-Veg', 'Spinach omelette on wholewheat toast', ['3-egg omelette', 'Palak', '2 slices wholewheat toast'], 420, 28, 30, 20, 5],
+  ['Lunch', 'North Indian', 'Veg', 'Rajma, jeera rice & cucumber raita', ['1.5 katori rajma', '1 katori rice', '1 katori raita', 'Lemon wedge'], 560, 22, 88, 11, 14],
+  ['Lunch', 'South Indian', 'Veg', 'Sambar rice with beans poriyal & curd', ['1.5 katori sambar rice', '1 katori beans poriyal', '1 katori curd'], 540, 18, 84, 13, 11],
+  ['Lunch', 'Continental', 'Veg', 'Chickpea & paneer grain bowl', ['1 katori chickpeas', '60 g grilled paneer', '1 katori millet', 'Salad greens'], 590, 30, 66, 21, 13],
+  ['Lunch', 'North Indian', 'Non-Veg', 'Chicken curry with 2 roti & salad', ['150 g chicken curry', '2 roti', 'Kachumber salad'], 590, 40, 52, 22, 7],
+  ['Lunch', 'South Indian', 'Non-Veg', 'Kerala fish curry with red rice', ['150 g fish curry', '1 katori red rice', 'Thoran'], 560, 36, 62, 16, 6],
+  ['Lunch', 'Continental', 'Non-Veg', 'Grilled chicken, brown rice & sautéed veg', ['150 g grilled chicken', '1 katori brown rice', 'Sautéed broccoli & beans'], 570, 45, 55, 16, 7],
+  ['Snack', 'North Indian', 'Veg', 'Sprouts chaat with lemon', ['1 katori moong sprouts', 'Onion-tomato', 'Lemon', 'Chaat masala'], 180, 12, 28, 2, 7],
+  ['Snack', 'South Indian', 'Veg', 'Sundal (chickpea stir-fry)', ['1 katori boiled chana', 'Coconut', 'Mustard-curry leaf tadka'], 210, 10, 30, 6, 8],
+  ['Snack', 'Continental', 'Veg', 'Greek-style curd with flaxseed & fruit', ['150 g hung curd', '1 tbsp ground flaxseed', '1 apple'], 220, 12, 26, 8, 6],
+  ['Snack', 'North Indian', 'Non-Veg', 'Boiled egg chaat', ['2 boiled eggs', 'Onion-tomato', 'Lemon'], 170, 13, 6, 10, 1],
+  ['Dinner', 'North Indian', 'Veg', 'Palak paneer with 2 bajra roti', ['1 katori palak paneer', '2 bajra roti', 'Lemon'], 520, 24, 52, 23, 9],
+  ['Dinner', 'South Indian', 'Veg', 'Pesarattu with ginger chutney & curd', ['2 pesarattu', 'Ginger chutney', '1 katori curd'], 450, 22, 56, 13, 9],
+  ['Dinner', 'Continental', 'Veg', 'Lentil-vegetable soup with paneer toast', ['2 bowls masoor-veg soup', '2 slices wholewheat toast', '40 g paneer'], 470, 26, 54, 15, 12],
+  ['Dinner', 'North Indian', 'Non-Veg', 'Tandoori fish with dal & 1 roti', ['150 g tandoori fish', '1 katori dal', '1 roti', 'Salad'], 500, 44, 40, 16, 8],
+  ['Dinner', 'South Indian', 'Non-Veg', 'Chettinad egg curry with 2 ragi dosa', ['2-egg curry', '2 ragi dosas'], 480, 22, 52, 19, 7],
+  ['Dinner', 'Continental', 'Non-Veg', 'Herb chicken with quinoa-free millet pilaf', ['150 g herb chicken', '1 katori millet pilaf', 'Steamed veg'], 520, 42, 48, 16, 7],
+].map(([meal_type, cuisine, diet, name, ingredients, kcal, protein_g, carbs_g, fat_g, fiber_g]) => ({
+  meal_type, cuisine, diet, name, ingredients, kcal, protein_g, carbs_g, fat_g, fiber_g,
+  quantity: '1 plate', prep_min: 20, description: `A balanced ${cuisine} ${meal_type.toLowerCase()}.`,
+  why: 'Pairs a protein source with fibre-rich carbs for steady energy.',
+}));
+
+function offlineMeal(meal_type, cuisine, diet, exclude) {
+  const seen = new Set(exclude.map((e) => e.toLowerCase()));
+  const pool = OFFLINE_MEALS.filter((m) => m.meal_type === meal_type && m.cuisine === cuisine && (m.diet === diet || diet === 'Non-Veg'));
+  const fresh = pool.filter((m) => !seen.has(m.name.toLowerCase()));
+  const list = fresh.length ? fresh : pool;
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+function cleanMeal(m = {}) {
+  return {
+    name: String(m.name || 'Suggested meal').slice(0, 120),
+    description: String(m.description || '').slice(0, 300),
+    ingredients: (Array.isArray(m.ingredients) ? m.ingredients : []).slice(0, 12).map((s) => String(s).slice(0, 80)),
+    quantity: String(m.quantity || '1 serving').slice(0, 40),
+    kcal: Math.round(clampNum(m.kcal, 0, 3000)),
+    protein_g: round1(clampNum(m.protein_g, 0, 300)),
+    carbs_g: round1(clampNum(m.carbs_g, 0, 500)),
+    fat_g: round1(clampNum(m.fat_g, 0, 300)),
+    fiber_g: round1(clampNum(m.fiber_g, 0, 100)),
+    prep_min: Math.round(clampNum(m.prep_min ?? 20, 0, 240)),
+    why: String(m.why || '').slice(0, 300),
+  };
+}
+
+app.post('/api/generate-meal', h(async (req, res) => {
+  const b = req.body || {};
+  const pick = (v, list) => list.find((x) => x.toLowerCase() === String(v || '').toLowerCase());
+  const meal_type = pick(b.meal_type, MEAL_OPTIONS.meal_type);
+  const cuisine = pick(b.cuisine, MEAL_OPTIONS.cuisine);
+  const diet = pick(b.diet, MEAL_OPTIONS.diet);
+  if (!meal_type || !cuisine || !diet) {
+    return res.status(400).json({ error: `Choose meal_type (${MEAL_OPTIONS.meal_type.join('/')}), cuisine (${MEAL_OPTIONS.cuisine.join('/')}) and diet (${MEAL_OPTIONS.diet.join('/')})` });
+  }
+  const exclude = toList(b.exclude).map((s) => s.slice(0, 80)).slice(-15);
+  const profile = (await db.getHealthProfile(req.user.id)) || {};
+  const t = calcTargets(profileToInput(profile));
+  const target = { kcal: Math.round((t.calories * MEAL_SHARE[meal_type]) / 10) * 10, protein_g: Math.round(t.macros.protein_g * MEAL_SHARE[meal_type]) };
+  const allergies = (profile.allergies || []).join(', ');
+
+  let meal = null;
+  let source = 'offline';
+  if (genAI) {
+    const prompt = `You are a clinical nutritionist for Indian students and young professionals.
+Suggest EXACTLY ONE ${diet === 'Veg' ? 'vegetarian (no meat, fish or eggs; dairy is fine)' : 'non-vegetarian (built around egg, chicken, fish or mutton)'} ${cuisine} ${meal_type.toLowerCase()}.
+User: ${profile.age ?? 25}-year-old ${profile.sex ?? 'male'}, ${profile.weight_kg ?? 65} kg, goal "${profile.goal ?? 'maintain'}".
+Aim for about ${target.kcal} kcal and at least ${target.protein_g} g protein, with good fibre. Use ingredients easily bought in India; keep it practical to cook or order.
+${allergies ? `Strictly exclude these allergens: ${allergies}.` : ''}
+${exclude.length ? `Do NOT suggest any of these meals (already shown): ${exclude.join('; ')}.` : ''}
+Return ONLY JSON: {"name":string,"description":string (one sentence),"ingredients":[string] (with Indian household quantities),"quantity":string (serving size),"kcal":number,"protein_g":number,"carbs_g":number,"fat_g":number,"fiber_g":number,"prep_min":number,"why":string (one sentence: the nutritional reason this is a good pick)}`;
+    try {
+      meal = await geminiJSON(prompt, null, 0.9);
+      source = 'gemini';
+    } catch (err) {
+      console.error('[generate-meal] Gemini error:', err.message);
+    }
+  }
+  if (!meal) meal = offlineMeal(meal_type, cuisine, diet, exclude);
+  const clean = cleanMeal(meal);
+  await db.saveMealPlan(req.user.id, `${meal_type} · ${cuisine} · ${diet}`, [clean], clean.kcal);
+  res.json({ meal: clean, source, request: { meal_type, cuisine, diet }, target });
+}));
 
 // ---------------------------------------------------------------------------
 // Barcode → Open Food Facts (proxied so the client never depends on a 3rd-party CORS policy)
@@ -370,19 +414,12 @@ function cleanVisionItems(items = []) {
 
 app.post('/api/vision', h(async (req, res) => {
   const mode = req.body?.mode === 'menu' ? 'menu' : 'meal';
-  const raw = String(req.body?.image || '');
-  const m = /^data:(image\/(?:jpeg|png|webp|heic|heif));base64,(.+)$/i.exec(raw);
-  const mimeType = m ? m[1].toLowerCase() : String(req.body?.mimeType || 'image/jpeg');
-  const data = m ? m[2] : raw;
-  if (!data || !/^[A-Za-z0-9+/=\s]+$/.test(data.slice(0, 200))) return res.status(400).json({ error: 'image must be a base64 data URL' });
-  if (!/^image\/(jpeg|png|webp|heic|heif)$/.test(mimeType)) return res.status(400).json({ error: 'Unsupported image type' });
-  if (data.length > 7_000_000) return res.status(413).json({ error: 'Image too large (max ~5 MB)' });
+  const img = parseImage(req.body);
+  if (img.error) return res.status(img.status).json({ error: img.error });
 
   if (!genAI) return res.json({ mode, source: 'demo', ...DEMO_VISION[mode] });
   try {
-    const model = genAI.getGenerativeModel({ model: VISION_MODEL, generationConfig: { responseMimeType: 'application/json', temperature: 0.2 } }, AI_TIMEOUT);
-    const result = await model.generateContent([{ text: VISION_PROMPTS[mode] }, { inlineData: { mimeType, data } }]);
-    const parsed = JSON.parse(result.response.text().replace(/^```(?:json)?|```$/g, '').trim());
+    const parsed = await geminiJSON(VISION_PROMPTS[mode], img);
     res.json({
       mode, source: 'gemini', model: VISION_MODEL,
       items: cleanVisionItems(parsed.items),
@@ -394,6 +431,57 @@ app.post('/api/vision', h(async (req, res) => {
     res.status(502).json({ error: `AI vision failed: ${err.message.slice(0, 200)}` });
   }
 }));
+
+// ---------------------------------------------------------------------------
+// Hostel Menu — mess-menu photo → Gemini Vision → saved list (hostel_menus) → log to food log
+// ---------------------------------------------------------------------------
+app.get('/api/hostel-menu', async (req, res) => res.json({ items: await db.listHostelMenu(req.user.id) }));
+
+app.post('/api/hostel-menu/scan', h(async (req, res) => {
+  const img = parseImage(req.body);
+  if (img.error) return res.status(img.status).json({ error: img.error });
+  let parsed;
+  let source = 'gemini';
+  if (!genAI) {
+    parsed = DEMO_VISION.menu;
+    source = 'demo';
+  } else {
+    try {
+      parsed = await geminiJSON(VISION_PROMPTS.menu, img);
+    } catch (err) {
+      console.error('[hostel-menu] Gemini error:', err.message);
+      return res.status(502).json({ error: `AI menu reading failed: ${err.message.slice(0, 200)}` });
+    }
+  }
+  const found = cleanVisionItems(parsed.items);
+  const added = found.length ? await db.addHostelMenuItems(req.user.id, found) : [];
+  res.status(added.length ? 201 : 200).json({
+    source, added, items: await db.listHostelMenu(req.user.id),
+    notes: String(parsed.notes || (found.length ? '' : 'No menu items found — try a clearer, well-lit photo.')).slice(0, 400),
+  });
+}));
+
+app.delete('/api/hostel-menu/:id', async (req, res) => {
+  if (!(await db.deleteHostelMenuItem(req.user.id, Number(req.params.id)))) return res.status(404).json({ error: 'Menu item not found' });
+  res.json({ deleted: Number(req.params.id), items: await db.listHostelMenu(req.user.id) });
+});
+
+app.delete('/api/hostel-menu', async (req, res) => res.json({ deleted: await db.clearHostelMenu(req.user.id), items: [] }));
+
+// "+ Add to Dashboard": copy the selected saved menu items into today's food log
+app.post('/api/hostel-menu/log', async (req, res) => {
+  const ids = (Array.isArray(req.body?.ids) ? req.body.ids : []).map(Number).filter(Number.isInteger).slice(0, 25);
+  if (!ids.length) return res.status(400).json({ error: 'Select at least one menu item' });
+  const rows = await db.getHostelMenuItems(req.user.id, ids);
+  if (!rows.length) return res.status(404).json({ error: 'Menu items not found' });
+  const logged = [];
+  for (const r of rows) {
+    logged.push(await db.addMeal(req.user.id, {
+      name: r.name, quantity: r.quantity, kcal: r.kcal, protein_g: r.protein_g, carbs_g: r.carbs_g, fat_g: r.fat_g, source: 'ai_menu',
+    }));
+  }
+  res.status(201).json({ logged, totals: await db.mealTotals(req.user.id) });
+});
 
 // ---------------------------------------------------------------------------
 // Meal logging — every log path ends here; the client then re-fetches /api/dashboard
@@ -532,59 +620,88 @@ app.put('/api/conditions', async (req, res) => {
   res.json({ active: wanted });
 });
 
-// --- Tab 2: Day 1–14 recovery roadmap (checklist state in recovery_checks) ---
+// --- Tab 2: Illness recovery roadmap — Day 1–3 / 4–7 / 8–14 checklists (state in recovery_checks) ---
+// A check is stored with day = the phase's first day (1, 4 or 8) and item = index within that phase.
 const RECOVERY = {
-  dengue: {
-    condition: 'Dengue', icon: '🦟',
-    warning: 'Seek medical care immediately for bleeding, severe abdominal pain, persistent vomiting, or drowsiness. Avoid NSAIDs (ibuprofen/aspirin) unless prescribed.',
+  viral_cold: {
+    condition: 'Viral Fever & Common Cold', icon: '🤒',
+    warning: 'See a doctor if fever is above 103°F (39.4°C), lasts more than 3 days, or comes with breathlessness, chest pain, a stiff neck, a rash or confusion. Use paracetamol only as advised; antibiotics do not treat viral infections.',
     phases: [
-      { from: 1, to: 3, name: 'Hydration Phase', texture: 'liquid', fluids_l: '3–4', goal: 'Prevent dehydration, support platelets',
-        foods: ['ORS every 1–2 hrs', 'Coconut water (2 glasses)', 'Rice kanji / dal water', 'Pomegranate juice', 'Papaya (1 bowl)', 'Kiwi (1–2)'],
-        avoid: ['Oily/spicy food', 'Caffeine', 'Cold drinks'], extra: ['Record temperature 3× today', 'Check for warning signs: bleeding gums, black stools, severe belly pain'] },
-      { from: 4, to: 7, name: 'Soft Food Phase', texture: 'semi-solid', fluids_l: '3', goal: 'Easy digestion, rebuild strength',
-        foods: ['Moong dal khichdi', 'Curd rice', 'Steamed idli (2–3)', 'Boiled vegetables', 'Clear vegetable soup', 'Banana'],
-        avoid: ['Fried snacks', 'Street food', 'Heavy non-veg'], extra: ['Platelet count as advised by doctor', 'Rest — no exertion'] },
-      { from: 8, to: 14, name: 'Rebuild Phase', texture: 'solid', fluids_l: '2.5–3', goal: 'Restore protein & iron stores',
-        foods: ['Paneer or 2 eggs', 'Dal + 2 roti', 'Leafy greens with lemon', 'Beetroot salad', 'Dates (3–4)', 'Sprouts chaat'],
-        avoid: ['Alcohol', 'Intense workouts'], extra: ['Light 10-min walk', '8 hours of sleep'] },
+      { from: 1, to: 3, name: 'Hydrate & Rest', texture: 'liquid', goal: 'Replace fluid lost to fever and sweating; let the immune system work',
+        items: [
+          'Drink 2.5–3 L of fluids a day: warm water, ORS, coconut water, clear soups',
+          '1 glass ORS or nimbu-pani with a pinch of salt & sugar, twice a day',
+          'Warm rasam, dal water or vegetable soup at least twice',
+          'Small, soft meals every 3 hours if hungry: rice kanji, soft khichdi',
+          'Tulsi-ginger warm water with 1 tsp honey for sore throat & cough',
+          'Steam inhalation and warm salt-water gargle, 2–3 times a day',
+          'Record temperature morning and evening',
+          'Avoid cold drinks, ice cream, fried food and alcohol',
+        ] },
+      { from: 4, to: 7, name: 'Gentle Nutrition', texture: 'semi-solid', goal: 'Restore energy and protein without straining digestion',
+        items: [
+          '3 soft meals + 2 snacks: moong dal khichdi, curd rice, idli, dalia',
+          'Protein at every meal: dal, curd, paneer or 2 eggs (non-veg)',
+          'One vitamin C food daily: amla, guava, orange or lemon water',
+          'Zinc foods for immune recovery: roasted chana, pumpkin seeds, curd',
+          'Keep fluids at 2.5 L a day',
+          'Sleep 8+ hours; only light walking indoors',
+          'Fever still present on day 5? Get a CBC / doctor review',
+        ] },
+      { from: 8, to: 14, name: 'Rebuild', texture: 'solid', goal: 'Rebuild muscle and iron lost during illness',
+        items: [
+          'Back to a normal thali with ¼ plate protein',
+          'Protein about 1.2 g per kg body weight a day',
+          'Pair iron foods with vitamin C (rajma / palak with lemon)',
+          'Curd or buttermilk daily to restore gut health',
+          'Resume exercise at ~50% intensity, building up over the week',
+          'Cough lasting beyond 2 weeks → see a doctor',
+        ] },
     ],
   },
-  viral_fever: {
-    condition: 'Viral Fever', icon: '🤒',
-    warning: 'Consult a doctor if fever exceeds 103°F (39.4°C) or lasts beyond 3 days.',
+  food_poisoning: {
+    condition: 'Food Poisoning', icon: '🤢',
+    warning: 'Seek care immediately for blood in stool, fever above 101.5°F (38.6°C), signs of dehydration (very little urine, dizziness, dry mouth), vomiting that stops you keeping fluids down for 24 hours, or diarrhoea lasting more than 3 days. Don\'t take anti-diarrhoeal medicine unless a doctor prescribes it.',
     phases: [
-      { from: 1, to: 3, name: 'Liquid Phase', texture: 'liquid', fluids_l: '3', goal: 'Hydrate and reduce fever load',
-        foods: ['ORS (2–3 glasses)', 'Warm tulsi-ginger water', 'Clear vegetable soup', 'Coconut water', 'Rice kanji'],
-        avoid: ['Dairy if nauseous', 'Fried food', 'Cold drinks'], extra: ['Record temperature 3× today', 'Rest in a cool, ventilated room'] },
-      { from: 4, to: 7, name: 'Khichdi Phase', texture: 'semi-solid', fluids_l: '2.5–3', goal: 'Gentle energy and protein',
-        foods: ['Moong dal khichdi with ghee', 'Curd rice', 'Banana', 'Dalia', 'Steamed idli'],
-        avoid: ['Spicy curries', 'Packaged snacks'], extra: ['Short walk inside the room', 'Note appetite: poor / ok / good'] },
-      { from: 8, to: 14, name: 'Back-to-Normal Phase', texture: 'solid', fluids_l: '2.5', goal: 'Rebuild muscle lost during fever',
-        foods: ['Roti + dal + sabzi', 'Paneer / eggs', 'Sprouts chaat with lemon', 'Seasonal fruit', 'Curd'],
-        avoid: ['Skipping meals', 'Heavy gym sessions'], extra: ['Protein at every meal', 'Ease back into normal activity'] },
+      { from: 1, to: 3, name: 'Rehydrate', texture: 'liquid', goal: 'Replace water and electrolytes; rest the gut',
+        items: [
+          'Sip ORS: 200–400 ml after every loose stool',
+          'If vomiting: small sips every 5–10 min; wait 30 min after vomiting, then restart',
+          'Rice kanji, dal water, coconut water, clear soup',
+          'Once vomiting settles: banana, plain rice, toast, stewed apple',
+          'Check urine is pale yellow; count loose stools',
+          'Avoid milk, spicy, oily food, caffeine, alcohol, raw salads and street food',
+        ] },
+      { from: 4, to: 7, name: 'Gut-Soothing Foods', texture: 'semi-solid', goal: 'Reintroduce easy-to-digest food and good bacteria',
+        items: [
+          'Curd rice or buttermilk daily (probiotic)',
+          'Moong dal khichdi, idli, steamed vegetables',
+          '5–6 small meals instead of 3 large ones',
+          'Reintroduce soft protein: moong dal, soft paneer, boiled egg',
+          'Keep fluids at 2.5–3 L a day',
+          'Still avoid raw, fried and outside food',
+        ] },
+      { from: 8, to: 14, name: 'Restore', texture: 'solid', goal: 'Return to a normal, fibre-rich diet safely',
+        items: [
+          'Add fibre back gradually: oats, whole fruit, roti, millets',
+          'Probiotic + prebiotic daily: curd with banana or onion',
+          'Lactose intolerance can last ~2 weeks — cut back milk if bloated',
+          'Freshly cooked food and safe drinking water only',
+          'Wash hands before eating; avoid the vendor or dish that caused it',
+        ] },
     ],
   },
 };
 
-function recoveryRoadmap(planKey) {
-  const plan = RECOVERY[planKey];
-  const days = Array.from({ length: 14 }, (_, i) => {
-    const day = i + 1;
-    const ph = plan.phases.find((p) => day >= p.from && day <= p.to);
-    const k = day - ph.from; // rotate foods so each day differs
-    const foods = [0, 1, 2].map((j) => ph.foods[(k + j) % ph.foods.length]);
-    return {
-      day, phase: ph.name, texture: ph.texture, goal: ph.goal,
-      items: [`💧 Drink ${ph.fluids_l} L fluids`, ...foods.map((f) => `🍽️ ${f}`), `🚫 Avoid: ${ph.avoid.join(', ')}`, ...ph.extra.map((e) => `✅ ${e}`)],
-    };
-  });
-  return { key: planKey, condition: plan.condition, icon: plan.icon, warning: plan.warning,
-    phases: plan.phases.map(({ from, to, name, texture }) => ({ from, to, name, texture })), days };
-}
+const recoveryRoadmap = (key) => {
+  const p = RECOVERY[key];
+  return { key, condition: p.condition, icon: p.icon, warning: p.warning, phases: p.phases };
+};
+const PLAN_LABELS = Object.fromEntries(Object.entries(RECOVERY).map(([k, p]) => [k, `${p.icon} ${p.condition}`]));
 
 app.get('/api/recovery/:plan', async (req, res) => {
   if (!RECOVERY[req.params.plan]) return res.status(404).json({ error: `Unknown plan. Use: ${Object.keys(RECOVERY).join(', ')}` });
-  res.json({ ...recoveryRoadmap(req.params.plan), checks: await db.getRecoveryChecks(req.user.id, req.params.plan), plans: Object.keys(RECOVERY), disclaimer: DISCLAIMER });
+  res.json({ ...recoveryRoadmap(req.params.plan), checks: await db.getRecoveryChecks(req.user.id, req.params.plan), plans: PLAN_LABELS, disclaimer: DISCLAIMER });
 });
 
 app.post('/api/recovery/:plan/check', async (req, res) => {
@@ -593,14 +710,20 @@ app.post('/api/recovery/:plan/check', async (req, res) => {
   if (req.body?.reset) { await db.resetRecovery(req.user.id, plan); return res.json({ checks: [] }); }
   const day = Number(req.body?.day);
   const item = Number(req.body?.item);
-  const roadmap = recoveryRoadmap(plan);
-  if (!Number.isInteger(day) || day < 1 || day > 14) return res.status(400).json({ error: 'day must be 1–14' });
-  if (!Number.isInteger(item) || item < 0 || item >= roadmap.days[day - 1].items.length) return res.status(400).json({ error: 'invalid item' });
+  const phase = RECOVERY[plan].phases.find((p) => p.from === day);
+  if (!phase) return res.status(400).json({ error: `day must be the start of a phase: ${RECOVERY[plan].phases.map((p) => p.from).join(', ')}` });
+  if (!Number.isInteger(item) || item < 0 || item >= phase.items.length) return res.status(400).json({ error: 'invalid item' });
   await db.setRecoveryCheck(req.user.id, plan, day, item, Boolean(req.body?.done));
   res.json({ checks: await db.getRecoveryChecks(req.user.id, plan) });
 });
 
-// --- Tab 1: Lab Analyzer ---
+// --- Tab 1: Lab Analyzer (lab report photo → Gemini Vision → values → status + food fixes) ---
+const IRON_FIXES = {
+  veg: ['Rajma / chole + lemon (Vitamin C doubles uptake)', 'Bajra or ragi roti', 'Soy chunks 50 g', 'Til + jaggery chikki', 'Amla or guava with meals'],
+  egg: ['Eggs + plant iron sources with lemon'],
+  nonveg: ['Chicken liver / mutton (heme iron absorbs 2–3× better)', 'Fish 2–3×/week'],
+  vegan: ['Soy chunks, rajma, methi with lemon', 'Cook in a cast-iron kadhai'],
+};
 const LAB_METRICS = {
   b12: { metric: 'Vitamin B12', unit: 'pg/mL', ref: '200–900',
     bands: [[200, 'deficient'], [300, 'borderline'], [900, 'normal'], [Infinity, 'high']], nutrient: 'b12_mcg',
@@ -611,15 +734,6 @@ const LAB_METRICS = {
       vegan: ['B12 supplement is essentially required for vegans', 'Fortified soy milk', 'Nutritional yeast'],
     },
     note: 'Deficiency causes fatigue, tingling, poor memory. If < 200 pg/mL, a doctor will usually prescribe B12 supplements or injections — food alone rarely corrects it.' },
-  ferritin: { metric: 'Serum Ferritin', unit: 'ng/mL', ref: '30–300',
-    bands: [[15, 'deficient'], [30, 'low'], [300, 'normal'], [Infinity, 'high']], nutrient: 'iron_mg',
-    fixes: {
-      veg: ['Rajma / chole + lemon (Vitamin C doubles uptake)', 'Bajra or ragi roti', 'Soy chunks 50 g', 'Til + jaggery chikki', 'Amla or guava with meals'],
-      egg: ['Eggs + plant iron sources with lemon'],
-      nonveg: ['Chicken liver / mutton (heme iron absorbs 2–3× better)', 'Fish 2–3×/week'],
-      vegan: ['Soy chunks, rajma, methi with lemon', 'Cook in a cast-iron kadhai'],
-    },
-    note: 'Keep chai/coffee 45+ min away from meals (tannins block iron). Below 15 ng/mL usually needs a doctor-prescribed iron supplement.' },
   vitamin_d: { metric: 'Vitamin D (25-OH)', unit: 'ng/mL', ref: '30–100',
     bands: [[20, 'deficient'], [30, 'insufficient'], [100, 'normal'], [Infinity, 'high']], nutrient: 'vitamin_d_iu',
     fixes: {
@@ -629,8 +743,13 @@ const LAB_METRICS = {
       vegan: ['Midday sun', 'Fortified plant milk', 'UV-exposed mushrooms'],
     },
     note: 'Below 20 ng/mL, doctors typically prescribe a D3 loading dose (e.g. 60,000 IU weekly). Food alone cannot fix a true deficiency. Above 100 can be toxic — stop supplements and consult.' },
-  hemoglobin: { metric: 'Hemoglobin', unit: 'g/dL', ref: null,
-    bands: null, nutrient: 'iron_mg',
+  ferritin: { metric: 'Serum Ferritin', unit: 'ng/mL', ref: '30–300',
+    bands: [[15, 'deficient'], [30, 'low'], [300, 'normal'], [Infinity, 'high']], nutrient: 'iron_mg', fixes: IRON_FIXES,
+    note: 'Keep chai/coffee 45+ min away from meals (tannins block iron). Below 15 ng/mL usually needs a doctor-prescribed iron supplement.' },
+  serum_iron: { metric: 'Serum Iron', unit: 'µg/dL', ref: '60–170',
+    bands: [[40, 'deficient'], [60, 'low'], [170, 'normal'], [Infinity, 'high']], nutrient: 'iron_mg', fixes: IRON_FIXES,
+    note: 'Serum iron swings through the day — ferritin is the better measure of iron stores. Ask for ferritin + CBC if this is low.' },
+  hemoglobin: { metric: 'Hemoglobin', unit: 'g/dL', ref: null, bands: null, nutrient: 'iron_mg',
     fixes: {
       veg: ['Iron foods + Vitamin C (lemon, amla) at every meal', 'Jaggery + roasted chana snack', 'Beetroot & pomegranate'],
       egg: ['Eggs + iron-rich dal with lemon'], nonveg: ['Lean red meat / liver once a week'], vegan: ['Soy, rajma, methi with lemon'],
@@ -649,18 +768,10 @@ function classify(key, value, sex) {
 
 const dietKey = (d) => ({ vegetarian: 'veg', eggetarian: 'egg', 'non-veg': 'nonveg', vegan: 'vegan' }[d] || 'veg');
 
-app.get('/api/labs', async (req, res) => res.json({ observations: await db.getHealthObservations(req.user.id), metrics: Object.fromEntries(
-  Object.entries(LAB_METRICS).map(([k, m]) => [k, { metric: m.metric, unit: m.unit }]),
-) }));
-
-app.post('/api/lab-analyze', async (req, res) => {
-  const profile = (await db.getHealthProfile(req.user.id)) || {};
+// Classify each { key: value } reading, save it to health_observations and build diet-specific food fixes
+async function analyzeLabValues(userId, profile, values) {
   const results = [];
-  for (const key of Object.keys(LAB_METRICS)) {
-    const raw = req.body?.[key];
-    if (raw === undefined || raw === null || raw === '') continue;
-    const value = Number(raw);
-    if (!Number.isFinite(value) || value <= 0 || value > 5000) return res.status(400).json({ error: `${LAB_METRICS[key].metric}: enter a positive number` });
+  for (const [key, value] of Object.entries(values)) {
     const m = LAB_METRICS[key];
     const { status, ref } = classify(key, value, profile.sex);
     const d = dietKey(profile.diet_type);
@@ -672,12 +783,104 @@ app.post('/api/lab-analyze', async (req, res) => {
         .filter((f) => !['vegetarian', 'vegan'].includes(profile.diet_type) || f.category !== 'animal')
         .sort((a, b) => b[m.nutrient] - a[m.nutrient]).slice(0, 4)
         .map((f) => `${f.name} (${f[m.nutrient]}${m.nutrient.endsWith('_mcg') ? ' mcg' : m.nutrient.endsWith('_iu') ? ' IU' : ' mg'}/100 g)`);
-    await db.addObservation(req.user.id, { metric: m.metric, value, unit: m.unit, reference_range: ref, status });
+    await db.addObservation(userId, { metric: m.metric, value, unit: m.unit, reference_range: ref, status });
     results.push({ key, metric: m.metric, value, unit: m.unit, reference_range: ref, status, fixes, top_foods, note: m.note });
   }
-  if (!results.length) return res.status(400).json({ error: 'Enter at least one lab value' });
-  res.json({ results, diet_type: profile.diet_type, disclaimer: DISCLAIMER });
+  return results;
+}
+
+app.get('/api/labs', async (req, res) => res.json({ observations: await db.getHealthObservations(req.user.id), metrics: Object.fromEntries(
+  Object.entries(LAB_METRICS).map(([k, m]) => [k, { metric: m.metric, unit: m.unit }]),
+) }));
+
+// JSON API (manual values) — kept for integrations; the UI uploads a report photo instead
+app.post('/api/lab-analyze', async (req, res) => {
+  const profile = (await db.getHealthProfile(req.user.id)) || {};
+  const values = {};
+  for (const key of Object.keys(LAB_METRICS)) {
+    const raw = req.body?.[key];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0 || value > 5000) return res.status(400).json({ error: `${LAB_METRICS[key].metric}: enter a positive number` });
+    values[key] = value;
+  }
+  if (!Object.keys(values).length) return res.status(400).json({ error: 'Enter at least one lab value' });
+  res.json({ results: await analyzeLabValues(req.user.id, profile, values), diet_type: profile.diet_type, disclaimer: DISCLAIMER });
 });
+
+const LAB_PROMPT = `You are reading a photo of a blood test / lab report. Extract Vitamin B12, Vitamin D, and Iron levels. Return strictly JSON.
+Use exactly this shape, with null for any test that is not on the report:
+{"vitamin_b12":{"value":number,"unit":string}|null,
+ "vitamin_d":{"value":number,"unit":string}|null,
+ "iron":{"test":"ferritin"|"serum_iron"|"hemoglobin","value":number,"unit":string}|null,
+ "report_date":string|null,
+ "notes":string}
+For iron, prefer Serum Ferritin; if absent use Serum Iron; if neither is present use Hemoglobin.
+Copy values and units exactly as printed. Never guess a value that is not visible. If the image is not a lab report, return all nulls and say so in notes.`;
+
+const DEMO_LAB = {
+  vitamin_b12: { value: 186, unit: 'pg/mL' }, vitamin_d: { value: 14.2, unit: 'ng/mL' },
+  iron: { test: 'ferritin', value: 22, unit: 'ng/mL' }, report_date: null,
+  notes: 'Demo values — AI is offline (set GEMINI_API_KEY to read real reports).',
+};
+
+// Normalise to the units LAB_METRICS uses (pg/mL, ng/mL, µg/dL, g/dL)
+function normaliseLab(parsed) {
+  const out = {};
+  const extracted = [];
+  const val = (x) => (x && Number.isFinite(Number(x.value)) && Number(x.value) > 0 ? Number(x.value) : null);
+  const unitOf = (x) => String(x?.unit || '').toLowerCase().replace(/\s/g, '');
+  let v = val(parsed.vitamin_b12);
+  if (v) {
+    const u = unitOf(parsed.vitamin_b12);
+    out.b12 = round1(u.includes('pmol') ? v * 1.355 : v);
+    extracted.push({ test: 'Vitamin B12', as_printed: `${v} ${parsed.vitamin_b12.unit || ''}`.trim() });
+  }
+  v = val(parsed.vitamin_d);
+  if (v) {
+    const u = unitOf(parsed.vitamin_d);
+    out.vitamin_d = round1(u.includes('nmol') ? v / 2.496 : v);
+    extracted.push({ test: 'Vitamin D', as_printed: `${v} ${parsed.vitamin_d.unit || ''}`.trim() });
+  }
+  v = val(parsed.iron);
+  if (v) {
+    const test = ['ferritin', 'serum_iron', 'hemoglobin'].includes(parsed.iron.test) ? parsed.iron.test : 'ferritin';
+    const u = unitOf(parsed.iron);
+    if (test === 'serum_iron') out.serum_iron = round1(u.includes('µmol') || u.includes('umol') ? v * 5.585 : v);
+    else if (test === 'hemoglobin') out.hemoglobin = round1(u === 'g/l' ? v / 10 : v);
+    else out.ferritin = round1(v); // ng/mL == µg/L
+    extracted.push({ test: { ferritin: 'Iron (Ferritin)', serum_iron: 'Iron (Serum Iron)', hemoglobin: 'Iron (Hemoglobin)' }[test], as_printed: `${v} ${parsed.iron.unit || ''}`.trim() });
+  }
+  return { values: out, extracted };
+}
+
+app.post('/api/lab-report', h(async (req, res) => {
+  const img = parseImage(req.body);
+  if (img.error) return res.status(img.status).json({ error: img.error });
+  let parsed;
+  let source = 'gemini';
+  if (!genAI) {
+    parsed = DEMO_LAB;
+    source = 'demo';
+  } else {
+    try {
+      parsed = await geminiJSON(LAB_PROMPT, img, 0);
+    } catch (err) {
+      console.error('[lab-report] Gemini error:', err.message);
+      return res.status(502).json({ error: `AI could not read the report: ${err.message.slice(0, 200)}` });
+    }
+  }
+  const { values, extracted } = normaliseLab(parsed || {});
+  const notes = String(parsed?.notes || '').slice(0, 400);
+  if (!Object.keys(values).length) {
+    return res.status(422).json({ error: notes || 'No Vitamin B12, Vitamin D or iron values found on this image — try a sharper, well-lit photo of the report.' });
+  }
+  const profile = (await db.getHealthProfile(req.user.id)) || {};
+  res.json({
+    source, extracted, report_date: parsed.report_date || null, notes,
+    results: await analyzeLabValues(req.user.id, profile, values), diet_type: profile.diet_type, disclaimer: DISCLAIMER,
+  });
+}));
 
 // ===========================================================================
 // MODULE 4. SUPPLEMENTS — interaction checker, quiz, sponsored partners
@@ -769,43 +972,195 @@ const SPONSORED = [
 app.get('/api/sponsored', (req, res) => res.json({ products: SPONSORED, placeholder: true, label: 'Sponsored' }));
 
 // ===========================================================================
-// ANALYTICS — nutrient gaps + real 7-day calorie history
+// ANALYTICS — Micronutrient Gap Dashboard (computed from the user's logged food)
 // ===========================================================================
-const DIARY_7DAY = { b12_mcg: 0.7, vitamin_d_iu: 170, iron_mg: 13, iron_absorption_pct: 5, ala_g: 0.6, la_g: 12, fiber_g: 17 };
+// Micronutrient estimates per typical serving, matched on the logged food's name.
+// Approximate IFCT 2017 / USDA values — a mock layer until a full micronutrient DB exists.
+// Fields: b12 mcg · vd IU · fe_h heme iron mg · fe nonheme iron mg · zn mg · o3 omega-3 g (ALA+EPA/DHA) · o6 omega-6 (LA) g · fib g
+// Flags: vc = vitamin C source (enhances non-heme iron) · blk = tannin source (blocks non-heme iron)
+const MICRO_DB = [
+  [/liver|kaleji/, { b12: 30, vd: 40, fe_h: 6, zn: 4, o3: 0.1, o6: 0.4 }],
+  [/fish|rohu|mackerel|bangda|salmon|pomfret|surmai|sardine|tuna|prawn|shrimp/, { b12: 3, vd: 400, fe_h: 0.8, zn: 0.8, o3: 1.0, o6: 0.3 }],
+  [/mutton|lamb|goat|keema|rogan josh/, { b12: 2.5, vd: 5, fe_h: 2.5, zn: 5, o3: 0.05, o6: 0.4 }],
+  [/chicken|murgh/, { b12: 0.3, vd: 5, fe_h: 1, zn: 2, o3: 0.05, o6: 2.5 }],
+  [/egg|omelet|anda/, { b12: 1.1, vd: 82, fe: 1.8, zn: 1.3, o3: 0.05, o6: 1.1 }],
+  [/paneer/, { b12: 0.8, vd: 10, fe: 0.2, zn: 1.5, o3: 0.1, o6: 0.5 }],
+  [/cheese|pizza/, { b12: 0.5, vd: 6, zn: 1.2, fe: 1.5, o6: 2, fib: 2 }],
+  [/curd|dahi|yog(h)?urt|raita|lassi|buttermilk|chaas/, { b12: 0.4, vd: 2, fe: 0.1, zn: 0.6, o6: 0.1 }],
+  [/(?<!butter)milk|doodh|shake/, { b12: 0.9, vd: 80, zn: 0.9 }],
+  [/soy|soya|tofu/, { fe: 5, zn: 2.5, o3: 0.6, o6: 4.5, fib: 6 }],
+  [/rajma|chole|chana|chickpea|kidney bean|sundal|lobia/, { fe: 3, zn: 1.7, o3: 0.1, o6: 0.4, fib: 8 }],
+  [/dal|daal|lentil|moong|masoor|toor|arhar|sambar|chilla|pesarattu/, { fe: 2.5, zn: 1.3, o3: 0.05, o6: 0.3, fib: 5 }],
+  [/sprout/, { fe: 1.5, zn: 1, fib: 4, vc: 1 }],
+  [/sattu/, { fe: 2, zn: 1.2, fib: 7 }],
+  [/palak|spinach|methi|saag|sarson/, { fe: 2.5, zn: 0.5, o3: 0.1, fib: 2.5 }],
+  [/ragi|bajra|jowar|millet|nachni/, { fe: 3, zn: 1.5, o6: 0.5, fib: 6 }],
+  [/oats?|dalia|upma/, { fe: 2, zn: 1.5, o6: 0.8, fib: 4 }],
+  [/poha/, { fe: 2.6, zn: 0.5, fib: 1.5 }],
+  [/roti|chapati|chapatti|phulka|paratha|naan|kulcha/, { fe: 2, zn: 1.2, o6: 0.4, fib: 4 }],
+  [/idli|dosa|uttapam|appam/, { fe: 1, zn: 0.8, o6: 0.3, fib: 2 }],
+  [/rice|chawal|biryani|pulao|khichdi|kanji/, { fe: 0.6, zn: 1, o6: 0.2, fib: 0.6 }],
+  [/bread|toast|sandwich|burger|pasta|noodle|maggi/, { fe: 1.5, zn: 0.8, o6: 2.5, fib: 2 }],
+  [/flax|alsi/, { o3: 2.3, o6: 0.6, fib: 2.7 }],
+  [/chia/, { o3: 2.5, o6: 0.8, fib: 4 }],
+  [/walnut|akhrot/, { o3: 2.5, o6: 10, zn: 0.9, fib: 2 }],
+  [/pumpkin seed/, { zn: 2.2, fe: 2.5, o6: 5.8, fib: 1.8 }],
+  [/peanut|groundnut|chikki|moongphali/, { fe: 1, zn: 1, o6: 6, fib: 2.5 }],
+  [/almond|badam|cashew|kaju/, { fe: 1, zn: 0.9, o6: 3.5, fib: 3 }],
+  [/til|sesame/, { fe: 1.5, zn: 0.8, o6: 2.3, fib: 1.2 }],
+  [/mushroom/, { vd: 20, zn: 0.5, fib: 1 }],
+  [/samosa|pakora|pakoda|bhaji|puri|poori|bhatura|vada|fries|chips|namkeen|bhujia|kachori|fried/, { o6: 6, fib: 1 }],
+  [/amla|guava|orange|lemon|nimbu|kiwi|tomato|kachumber|capsicum/, { vc: 1, fib: 2 }],
+  [/banana|apple|papaya|fruit|pomegranate|mango/, { fib: 3 }],
+  [/salad|sabzi|subzi|vegetable|veg |bhindi|gobi|beans|carrot|broccoli|poriyal|thoran|avial|stew/, { fe: 0.8, zn: 0.3, fib: 3, vc: 1 }],
+  [/chai|tea|coffee/, { blk: 1 }],
+];
+const MICRO_KEYS = ['b12', 'vd', 'fe_h', 'fe', 'zn', 'o3', 'o6', 'fib'];
+
+function estimateMicros(name, kcal) {
+  const n = ` ${String(name).toLowerCase()} `;
+  const out = Object.fromEntries(MICRO_KEYS.map((k) => [k, 0]));
+  let matched = false;
+  out.vc = 0; out.blk = 0;
+  for (const [re, v] of MICRO_DB) {
+    if (!re.test(n)) continue;
+    matched = true;
+    for (const k of [...MICRO_KEYS, 'vc', 'blk']) out[k] += v[k] || 0;
+  }
+  // Unrecognised dish: generic mixed Indian food density per 100 kcal
+  if (!matched) {
+    const per100 = Number(kcal || 0) / 100;
+    out.fe += 0.6 * per100; out.zn += 0.4 * per100; out.fib += 1.2 * per100; out.o6 += 1 * per100; out.o3 += 0.03 * per100;
+  }
+  return out;
+}
+
+// Targets: ICMR-NIN 2020 RDAs (B12, zinc), IOM (vitamin D, fibre 14 g / 1,000 kcal), physiological absorbed-iron need
+function microTargets(profile, kcalTarget) {
+  const female = profile.sex === 'female';
+  return {
+    b12: 2.5, vd: 600, iron_abs: female ? 1.8 : 1.1, zn: female ? 13.2 : 17,
+    ratio: 5, fib: Math.max(25, Math.round((14 * kcalTarget) / 1000)),
+  };
+}
+
+const riskOf = (pct) => (pct >= 80 ? 'Low' : pct >= 50 ? 'Moderate' : 'High');
+const RISK_RANK = { Low: 0, Moderate: 1, High: 2 };
+
+function microRecommendation(key, risk, ctx) {
+  const veg = ['vegetarian', 'vegan'].includes(ctx.diet);
+  const vegan = ctx.diet === 'vegan';
+  const R = {
+    b12: {
+      High: vegan ? 'Intake is under half the RDA and B12 is absent from plant foods. Get serum B12 (± homocysteine) tested; vegans almost always need a B12 supplement — dose to be set by your doctor.'
+        : veg ? 'Intake is under half the RDA. Get serum B12 tested; add 2 dairy servings daily (curd 200 g ≈ 0.8 mcg, milk 250 ml ≈ 1 mcg). Most Indian vegetarians need a doctor-advised supplement.'
+          : 'Intake is under half the RDA. Add eggs daily and fish 2–3×/week; get serum B12 tested if you have fatigue or tingling.',
+      Moderate: veg ? 'Add one more dairy serving daily (a bowl of curd or a glass of milk) — or fortified cereal.' : 'Add 2 eggs or a fish meal a few times a week to close the gap.',
+      Low: 'Intake meets the RDA — keep your current dairy/animal-protein pattern.',
+    },
+    vd: {
+      High: 'Diet supplies under half the requirement (typical for Indian diets). Get 15–30 min of midday sun on arms and legs 4–5×/week and test 25-OH vitamin D; if < 20 ng/mL a physician-supervised D3 course is standard.',
+      Moderate: `Add fortified milk (2 glasses)${veg ? '' : ', egg yolks or fatty fish weekly'} and keep regular midday sun exposure.`,
+      Low: 'Dietary vitamin D is adequate — sun exposure still matters for blood levels.',
+    },
+    iron: {
+      High: `Absorbed iron is under half your physiological need.${ctx.blocker ? ' Tea/coffee in your log is cutting non-heme iron absorption by up to half — keep it 60 min away from meals.' : ''} Pair every iron food with vitamin C (lemon, amla, guava) and check CBC + ferritin; a confirmed deficiency usually needs prescribed iron.`,
+      Moderate: `Add one iron-dense serving daily (rajma/chana, bajra roti, soy chunks${veg ? '' : ', chicken/mutton'}) with a squeeze of lemon${ctx.blocker ? '; move chai/coffee away from meals' : ''}.`,
+      Low: 'Bioavailable iron meets your need — keep pairing iron foods with vitamin C.',
+    },
+    zn: {
+      High: `Zinc is under half the RDA, and phytates in cereals and dals cut absorption further. Soak, sprout or ferment grains and legumes; add pumpkin seeds (30 g ≈ 2.2 mg), chana and paneer${veg ? '' : ', chicken or mutton'}.`,
+      Moderate: 'Add a handful of pumpkin or sesame seeds, or a katori of sprouts, daily.',
+      Low: 'Zinc intake meets the RDA.',
+    },
+    ratio: {
+      High: `Omega-6:omega-3 ratio ≈ ${ctx.ratioText} — strongly pro-inflammatory (aim ≤ 5:1). Swap sunflower/soybean oil for mustard oil, cut fried snacks, add 1 tbsp ground flaxseed daily (≈ 2.3 g ALA)${veg ? '' : ' and fatty fish twice a week'}.`,
+      Moderate: `Ratio ≈ ${ctx.ratioText}. Add 1 tbsp flax or chia seeds daily and use mustard oil for half your cooking.`,
+      Low: `Ratio ≈ ${ctx.ratioText} — within the anti-inflammatory range.`,
+    },
+    fib: {
+      High: 'Fibre is under half of target (14 g per 1,000 kcal). Swap polished rice for millets or brown rice 3×/week, add a katori of rajma/sprouts daily, and eat fruit whole — increase gradually with plenty of water.',
+      Moderate: 'Add one more serving of whole fruit or salad and a whole-grain roti or millet daily.',
+      Low: 'Fibre intake meets target — good for gut health, glucose and cholesterol.',
+    },
+  };
+  return R[key][risk];
+}
+
+// Lab readings override diet-based risk when they show a deficiency
+const LAB_LINK = { b12: ['Vitamin B12'], vd: ['Vitamin D (25-OH)'], iron: ['Serum Ferritin', 'Serum Iron', 'Hemoglobin'] };
+const LAB_RISK = { deficient: 'High', low: 'Moderate', borderline: 'Moderate', insufficient: 'Moderate' };
 
 app.get('/api/analytics', async (req, res) => {
   const uid = req.user.id;
-  const profile = await db.getHealthProfile(uid);
-  const totals = await db.mealTotals(uid);
+  const profile = (await db.getHealthProfile(uid)) || {};
   const t = calcTargets(profileToInput(profile));
-  const top = (key, n = 3) => [...FOODS].sort((a, b) => b[key] - a[key]).slice(0, n)
-    .map((f) => `${f.name} (${f[key]}${key.endsWith('_mcg') ? ' mcg' : key.endsWith('_iu') ? ' IU' : key.endsWith('_mg') ? ' mg' : ' g'})`);
-  const pct = (a, b) => Math.min(100, Math.round((a / b) * 100));
-  const d = DIARY_7DAY;
-  const absorbedIron = +(d.iron_mg * d.iron_absorption_pct / 100).toFixed(2);
-  const omegaRatio = Math.round(d.la_g / d.ala_g);
-  const pcTarget = t.macros.protein_g / t.macros.carbs_g;
-  const pcActual = totals.carbs_g > 0 ? totals.protein_g / totals.carbs_g : null;
+  const kcalTarget = profile.daily_calorie_target || t.calories;
+  const T = microTargets(profile, kcalTarget);
+  const WINDOW = 7;
+  const meals = await db.mealsSince(uid, db.daysAgo(WINDOW - 1));
+  const observations = await db.getHealthObservations(uid);
 
-  const gaps = [
-    { key: 'b12', label: 'Vitamin B12', actual: d.b12_mcg, target: 2.2, unit: 'mcg/day', pct: pct(d.b12_mcg, 2.2),
-      why: 'B12 is found almost only in animal foods; vegetarian diets with little dairy fall short.', fix: 'Curd/milk twice daily, eggs if eggetarian; test B12.', sources: top('b12_mcg') },
-    { key: 'vitamin_d', label: 'Vitamin D', actual: d.vitamin_d_iu, target: 600, unit: 'IU/day', pct: pct(d.vitamin_d_iu, 600),
-      why: 'Indoor lifestyles and few fortified foods despite abundant sunlight.', fix: '15–20 min midday sun; fortified milk; test 25-OH Vitamin D.', sources: top('vitamin_d_iu') },
-    { key: 'iron', label: 'Bioavailable Iron', actual: absorbedIron, target: 1.0, unit: 'mg absorbed/day', pct: pct(absorbedIron, 1.0),
-      why: `Plant iron absorbs poorly — ~${d.iron_absorption_pct}% when chai is taken with meals.`, fix: 'Lemon/amla with iron foods; chai 45+ min away.', sources: top('iron_mg') },
-    { key: 'omega', label: 'Omega-3 vs Omega-6', actual: `1:${omegaRatio}`, target: '1:4', unit: 'ALA:LA ratio', pct: pct(4, omegaRatio),
-      why: 'Sunflower/soybean oils push omega-6 high while omega-3 sources are rare.', fix: '1 tbsp ground flaxseed daily; mustard oil.', sources: top('omega3_g') },
-    { key: 'protein_carb', label: 'Protein : Carb Ratio',
-      actual: pcActual ? `1:${(1 / pcActual).toFixed(1)}` : 'no meals yet', target: `1:${(1 / pcTarget).toFixed(1)}`,
-      unit: 'today vs target', pct: pcActual ? pct(pcActual, pcTarget) : 0,
-      why: 'The rice/roti-heavy thali makes carbs ~75–80% of the plate.', fix: 'Quarter plate protein at every meal.', sources: top('protein_g') },
-    { key: 'fiber', label: 'Fiber', actual: d.fiber_g, target: 30, unit: 'g/day', pct: pct(d.fiber_g, 30),
-      why: 'Polished rice and maida strip out fibre.', fix: 'Millets 3×/week, sprouts, whole fruit.', sources: top('fiber_g') },
+  // Per-day totals, with iron absorption adjusted for enhancers / blockers eaten that day
+  const days = {};
+  const contrib = { b12: {}, vd: {}, iron: {}, zn: {}, o3: {}, fib: {} };
+  for (const m of meals) {
+    const mi = estimateMicros(m.name, m.kcal);
+    const d = days[m.log_date] ||= { b12: 0, vd: 0, fe_h: 0, fe: 0, zn: 0, o3: 0, o6: 0, fib: 0, vc: 0, blk: 0 };
+    for (const k of Object.keys(d)) d[k] += mi[k] || 0;
+    const add = (key, v) => { if (v > 0) contrib[key][m.name] = (contrib[key][m.name] || 0) + v; };
+    add('b12', mi.b12); add('vd', mi.vd); add('iron', mi.fe_h + mi.fe); add('zn', mi.zn); add('o3', mi.o3); add('fib', mi.fib);
+  }
+  const dates = Object.keys(days);
+  const n = dates.length;
+  let blockerDays = 0;
+  const avg = { b12: 0, vd: 0, iron_total: 0, iron_abs: 0, zn: 0, o3: 0, o6: 0, fib: 0 };
+  for (const d of Object.values(days)) {
+    // Heme ~25% absorbed; non-heme ~5%, doubled with vitamin C, ~halved by tannins (tea/coffee)
+    const nonhemeRate = 0.05 * (d.vc ? 2 : 1) * (d.blk ? 0.5 : 1);
+    if (d.blk) blockerDays += 1;
+    avg.b12 += d.b12; avg.vd += d.vd; avg.zn += d.zn; avg.o3 += d.o3; avg.o6 += d.o6; avg.fib += d.fib;
+    avg.iron_total += d.fe_h + d.fe;
+    avg.iron_abs += d.fe_h * 0.25 + d.fe * nonhemeRate;
+  }
+  if (n) for (const k of Object.keys(avg)) avg[k] /= n;
+
+  const ratio = avg.o3 > 0 ? avg.o6 / avg.o3 : (avg.o6 > 0 ? Infinity : null);
+  const ratioText = ratio === null ? '—' : ratio === Infinity ? 'no omega-3' : `${ratio.toFixed(1)} : 1`;
+  const pct = (a, b) => Math.round((a / b) * 100);
+  const top = (key) => Object.entries(contrib[key]).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name]) => name);
+  const ctx = { diet: profile.diet_type, blocker: blockerDays > 0, ratioText };
+
+  const metrics = [
+    { key: 'b12', label: 'Vitamin B12', value: round1(avg.b12), unit: 'mcg/day', target: T.b12, target_text: `${T.b12} mcg (ICMR RDA)`, pct: pct(avg.b12, T.b12), sources: top('b12') },
+    { key: 'vd', label: 'Vitamin D', value: Math.round(avg.vd), unit: 'IU/day', target: T.vd, target_text: `${T.vd} IU`, pct: pct(avg.vd, T.vd), sources: top('vd') },
+    { key: 'iron', label: 'Iron (Bioavailable)', value: Math.round(avg.iron_abs * 100) / 100, unit: 'mg absorbed/day', target: T.iron_abs,
+      target_text: `${T.iron_abs} mg absorbed`, pct: pct(avg.iron_abs, T.iron_abs), sources: top('iron'),
+      detail: `${round1(avg.iron_total)} mg eaten → ${(Math.round(avg.iron_abs * 100) / 100)} mg absorbed${blockerDays ? ` · tea/coffee on ${blockerDays} of ${n} days` : ''}` },
+    { key: 'zn', label: 'Zinc', value: round1(avg.zn), unit: 'mg/day', target: T.zn, target_text: `${T.zn} mg (ICMR RDA)`, pct: pct(avg.zn, T.zn), sources: top('zn') },
+    { key: 'ratio', label: 'Omega-3 : Omega-6', value: ratioText, unit: 'omega-6 : omega-3', target: T.ratio, target_text: '≤ 5 : 1',
+      pct: ratio === null ? 0 : ratio === Infinity ? 0 : Math.round(Math.min(150, (T.ratio / Math.max(ratio, 0.1)) * 100)), sources: top('o3'),
+      detail: `${round1(avg.o3)} g omega-3 · ${round1(avg.o6)} g omega-6 per day` },
+    { key: 'fib', label: 'Dietary Fiber', value: round1(avg.fib), unit: 'g/day', target: T.fib, target_text: `${T.fib} g (14 g/1,000 kcal)`, pct: pct(avg.fib, T.fib), sources: top('fib') },
   ];
+
+  for (const m of metrics) {
+    if (!n) { m.risk = 'No data'; m.recommendation = 'Log at least one day of meals to calculate this gap.'; continue; }
+    m.risk = m.key === 'ratio'
+      ? (ratio === Infinity || ratio > 10 ? 'High' : ratio > T.ratio ? 'Moderate' : 'Low')
+      : riskOf(m.pct);
+    const lab = observations.find((o) => (LAB_LINK[m.key] || []).includes(o.metric) && LAB_RISK[o.status]);
+    if (lab) {
+      m.lab = `${lab.metric} ${lab.value} ${lab.unit} (${lab.status}) on ${lab.observed_on}`;
+      if (RISK_RANK[LAB_RISK[lab.status]] > RISK_RANK[m.risk]) m.risk = LAB_RISK[lab.status];
+    }
+    m.recommendation = microRecommendation(m.key, m.risk, ctx);
+  }
+
   res.json({
-    gaps, observations: await db.getHealthObservations(uid), weekly: await db.weeklyCalories(uid), target_kcal: profile.daily_calorie_target || t.calories,
-    note: 'Micronutrients use a typical-diet baseline; the protein:carb ratio and weekly chart use your own logged meals.',
+    window_days: WINDOW, days_logged: n, items_logged: meals.length, metrics,
+    summary: { high: metrics.filter((m) => m.risk === 'High').length, moderate: metrics.filter((m) => m.risk === 'Moderate').length },
+    note: `Daily averages over the ${n} day(s) you logged in the last ${WINDOW} days. Micronutrients are estimated per serving from food names (approximate IFCT/USDA values); lab results override risk when they show a deficiency.`,
   });
 });
 

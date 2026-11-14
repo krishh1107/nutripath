@@ -19,7 +19,7 @@ async function api(url, opts = {}) {
   const headers = { ...(opts.body ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}) };
   const r = await fetch(url, { ...opts, headers: { ...headers, ...opts.headers } });
   const body = await r.json().catch(() => ({}));
-  if (r.status === 401 && !url.startsWith('/api/auth')) {
+  if (r.status === 401 && !url.startsWith('/api/auth') && url !== '/api/login') {
     // Offline guest has no session: don't bounce back to login, just fail this call
     if (state.guest) throw new Error('Guest mode — sign in to use this feature');
     signOut(true);
@@ -117,7 +117,7 @@ $('#googleSignIn').addEventListener('click', async () => {
 // (so data saves when the server allows demo login); otherwise enters the UI as an offline guest.
 async function continueAsGuest() {
   try {
-    const r = await post('/api/auth/demo', { name: 'Guest' });
+    const r = await post('/api/login', { name: 'Guest' });
     state.guest = false;
     return await startSession(r);
   } catch (e) {
@@ -133,7 +133,7 @@ $('#guestBtn').addEventListener('click', continueAsGuest);
 $('#demoForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
-    const r = await post('/api/auth/demo', Object.fromEntries(new FormData(e.target)));
+    const r = await post('/api/login', Object.fromEntries(new FormData(e.target)));
     await startSession(r);
   } catch (err) {
     showAuth(err.message);
@@ -305,7 +305,7 @@ function openSheet(title, html, chat = false) {
   $('#sheetBackdrop').hidden = isDesktop();
   if (chat && isDesktop()) $('#chatInput').focus();
 }
-function leaveView() { stopScanner(); chai.stop(); }
+function leaveView() { stopScanner(); }
 function closeSheet(force = false) {
   leaveView();
   if (isDesktop() && !force && state.user) return showView('welcome');
@@ -394,49 +394,58 @@ const views = {
       <span class="text-2xl">${icon}</span><span><b class="text-gray-900">${title}</b><br><span class="text-xs text-gray-500">${sub}</span></span></button>`;
     return { title: 'Workspace', html: `
       <p class="text-gray-500">Open a module — it renders here, side-by-side with your dashboard.</p>
-      ${shortcut('diet', '🍽️', 'Diet Planner', 'Meal plans · Barcode & AI photo logging · Hostel menu')}
-      ${shortcut('fitness', '👟', 'Fitness Nutrition', 'TDEE sliders · Workout fuel · Food log')}
-      ${shortcut('recovery', '❤️‍🩹', 'Health & Recovery', 'Lab analyzer · Day 1–14 recovery · Condition toggles')}
+      ${shortcut('diet', '🍽️', 'Diet Planner', 'AI meal suggestions · Hostel menu · Scan & log')}
+      ${shortcut('fitness', '👟', 'Fitness Nutrition', 'TDEE sliders · Today’s food log')}
+      ${shortcut('recovery', '❤️‍🩹', 'Health & Recovery', 'Lab report scan · Illness roadmap · Condition toggles')}
       ${shortcut('supplements', '💊', 'Supplement Hub', 'Interaction checker · AI quiz · Partner brands')}
       ${shortcut('chat', '🤖', 'AI Nutrition Chat', 'Gemini-powered Indian nutritionist')}
-      ${shortcut('analytics', '📊', 'Analytics', 'Weekly calories & nutrient gaps')}
+      ${shortcut('analytics', '📊', 'Analytics', 'Micronutrient gap dashboard')}
       ${shortcut('profile', '🧑🏽', 'Profile', 'Health sync · Daily email · Settings')}` };
   },
 
-  // ---------------- DIET PLANNER: [Meal Plans] [Scan & Log] [Hostel Menu] ----------------
+  // ---------------- DIET PLANNER: [Meal Plans] [Hostel Menu] [Scan & Log] ----------------
   async diet() {
     const d = await api('/api/diet-planner');
     loggable.clear();
-    const plansHtml = Object.values(d.plans).map((p) => `
-      <div class="box">
-        <p class="font-semibold text-gray-900">${esc(p.title)}</p>
-        <p class="text-xs text-gray-500 mt-0.5">${esc(p.problem)}</p>
-        <p class="text-xs bg-amber-50 text-amber-800 rounded-lg p-2 my-2">💡 ${esc(p.rule)}</p>
-        ${p.meals.map((m) => `<div class="flex items-center justify-between gap-2 py-1.5 border-t border-gray-50">
-          <span class="min-w-0"><b>${esc(m.slot)}:</b> ${m.items.map(esc).join(', ')}<br><span class="text-[0.7rem] text-gray-400">${macroLine(m)}</span></span>
-          ${logBtn({ name: `${m.slot}: ${m.items[0]}${m.items.length > 1 ? ` + ${m.items.length - 1} more` : ''}`, quantity: '1 meal', kcal: m.kcal, protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g, source: 'meal_plan' })}
-        </div>`).join('')}
-        <p class="text-xs text-right mt-1 text-emerald-700 font-medium">${fmt(p.total_kcal)} kcal · ${p.total_protein_g} g protein</p>
-      </div>`).join('');
+    const g = d.generator;
+    const defDiet = ['non-veg', 'eggetarian'].includes(state.dash?.profile?.diet_type) ? 'Non-Veg' : 'Veg';
+    const select = (name, label, list, cur) => `<div class="field"><label>${label}</label><select name="${name}">${list.map((v) => `<option ${v === cur ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></div>`;
+    const hour = new Date().getHours();
+    const defType = hour < 11 ? 'Breakfast' : hour < 16 ? 'Lunch' : hour < 19 ? 'Snack' : 'Dinner';
 
-    const swapsHtml = d.substitutions.map((s) => `
-      <div class="box">
-        <div class="flex items-center justify-between gap-2"><p class="font-semibold text-gray-900">${esc(s.from?.name)} → ${s.to.map((t) => esc(t.name)).join(' / ')}</p>${s.savings_pct != null ? pill(`save ${s.savings_pct}%`) : ''}</div>
-        <div class="overflow-x-auto mt-2"><table class="tbl"><tr><th>Food</th><th>Protein</th><th>Fibre</th><th>Iron</th><th>₹/kg</th></tr>
-          ${[s.from, ...s.to].filter(Boolean).map((f, i) => `<tr class="${i === 0 ? 'text-gray-400' : ''}"><td>${i === 0 ? '🌍' : '🇮🇳'} ${esc(f.name)}</td><td>${f.protein_g} g</td><td>${f.fiber_g} g</td><td>${f.iron_mg} mg</td><td>₹${fmt(f.cost_inr_per_kg)}</td></tr>`).join('')}
-        </table></div>
-        <p class="text-xs text-gray-600 mt-2">${esc(s.why)}</p>
-      </div>`).join('');
+    const swapsHtml = `<div class="overflow-x-auto"><table class="tbl swap-tbl">
+      <tr><th>Instead of</th><th>Choose (local)</th><th>Protein /100 g</th><th>₹/kg</th><th>Save</th></tr>
+      ${d.substitutions.map((s) => `<tr>
+        <td class="text-gray-500">🌍 ${esc(s.from?.name)}<br><span class="text-[0.65rem]">${s.from?.protein_g} g · ₹${fmt(s.from?.cost_inr_per_kg)}</span></td>
+        <td><b>🇮🇳 ${s.to.map((t) => esc(t.name)).join('<br>🇮🇳 ')}</b></td>
+        <td>${s.to.map((t) => `${t.protein_g} g`).join('<br>')}</td>
+        <td>${s.to.map((t) => `₹${fmt(t.cost_inr_per_kg)}`).join('<br>')}</td>
+        <td>${s.savings_pct != null ? pill(`${s.savings_pct}%`) : '—'}</td></tr>
+        <tr class="swap-why"><td colspan="5">${esc(s.why)}</td></tr>`).join('')}
+    </table></div>`;
 
-    const cb = d.chai_blocker;
-    const chaiHtml = `<div class="rounded-2xl p-4 bg-gradient-to-br from-amber-50 to-orange-50 border border-amber-100 text-center">
-        <p class="text-xs text-gray-600">${esc(cb.explanation)}</p>
-        <p id="chaiClock" class="text-4xl font-bold text-amber-700 my-3 tabular-nums">${cb.minutes}:00</p>
-        <p id="chaiStatus" class="text-xs text-gray-500 mb-3">Start the timer when you finish an iron-rich meal.</p>
-        <div class="flex gap-2 justify-center">
-          <button type="button" id="chaiStart" class="bg-amber-500 text-white rounded-full px-4 py-2 text-xs font-semibold">🍛 I just ate — start</button>
-          <button type="button" id="chaiReset" class="bg-white border border-amber-200 text-amber-700 rounded-full px-3 py-2 text-xs font-semibold">Reset</button>
-        </div></div>`;
+    const plansHtml = `
+      <form id="mealGenForm" class="box space-y-2">
+        <p class="font-semibold text-gray-900">✨ AI meal suggestion</p>
+        <p class="text-xs text-gray-500">Pick a meal, cuisine and diet — Gemini suggests one nutritious meal sized to your calorie and protein targets.</p>
+        <div class="grid grid-cols-3 gap-2">
+          ${select('meal_type', 'Meal type', g.meal_type, defType)}
+          ${select('cuisine', 'Cuisine', g.cuisine, g.cuisine[0])}
+          ${select('diet', 'Diet', g.diet, defDiet)}
+        </div>
+        <button class="btn-primary w-full" id="mealGenBtn">Suggest a meal</button>
+      </form>
+      <div id="mealGenResult"></div>
+      <div class="box"><p class="font-semibold text-gray-900 mb-2">🇮🇳 Smart local swaps</p>${swapsHtml}</div>`;
+
+    const hostelHtml = `
+      <div class="box space-y-2">
+        <p class="font-semibold text-gray-900">📋 Upload mess menu</p>
+        <p class="text-xs text-gray-500">Photograph the mess board or printed weekly menu. AI reads each dish, estimates macros and saves it to your menu below.</p>
+        <label class="upload-btn"><input type="file" accept="image/*" capture="environment" id="menuUpload" hidden>📋 Upload Menu Photo</label>
+        <div id="menuScanStatus"></div>
+      </div>
+      <div id="hostelMenu"><p class="text-xs text-gray-400">Loading saved menu…</p></div>`;
 
     const scanHtml = `
       <div class="box space-y-2">
@@ -470,31 +479,16 @@ const views = {
         </form>
       </details>`;
 
-    const hostelHtml = `
-      <div class="box space-y-2">
-        <p class="font-semibold text-gray-900">📋 Read my mess menu</p>
-        <p class="text-xs text-gray-500">Photograph the mess board or printed weekly menu — AI estimates each dish and flags the best protein picks.</p>
-        <label class="upload-btn"><input type="file" accept="image/*" capture="environment" data-vision="menu" hidden>📋 Upload Mess Menu</label>
-        <div id="visionMenuResult"></div>
-        ${d.mess_menu ? `<p class="text-xs text-gray-500">Saved typical menu: <i>${esc(d.mess_menu)}</i></p>` : ''}
-      </div>
-      <p class="font-semibold text-gray-900 pt-1">🫖 Hostel appliance recipes</p>
-      ${seg('hostelf', [['kettle', 'Kettle-Only'], ['mine', 'My Appliances'], ['all', 'All Recipes']], 'kettle')}
-      <div id="hostelList"></div>`;
-
     return { title: 'Diet Planner', html: `
-      ${seg('diet', [['plans', '🍱 Meal Plans'], ['scan', '📷 Scan & Log'], ['hostel', '🏫 Hostel Menu']], 'plans')}
-      ${pane('diet', 'plans', 'plans', `${plansHtml}
-        <details class="box"><summary class="font-semibold text-gray-900 cursor-pointer">🇮🇳 Smart local swaps</summary><div class="space-y-2 mt-3">${swapsHtml}</div></details>
-        <details class="box"><summary class="font-semibold text-gray-900 cursor-pointer">☕ ${esc(cb.title)} timer</summary><div class="mt-3">${chaiHtml}</div><p class="text-xs bg-amber-50 text-amber-800 rounded-lg p-2 mt-2">💡 ${esc(cb.rule)}</p></details>`)}
-      ${pane('diet', 'scan', 'plans', scanHtml)}
-      ${pane('diet', 'hostel', 'plans', hostelHtml)}`,
+      ${seg('diet', [['plans', '🍱 Meal Plans'], ['hostel', '🏫 Hostel Menu'], ['scan', '📷 Scan & Log']], 'plans')}
+      ${pane('diet', 'plans', 'plans', plansHtml)}
+      ${pane('diet', 'hostel', 'plans', hostelHtml)}
+      ${pane('diet', 'scan', 'plans', scanHtml)}`,
     after() {
-      loadHostel('kettle');
-      $('[data-seg="hostelf"]').addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) loadHostel(b.dataset.tab); });
-      $('#chaiStart').onclick = () => chai.start(cb.minutes);
-      $('#chaiReset').onclick = () => chai.reset(cb.minutes);
-      chai.render(cb.minutes);
+      mealGen.seen = [];
+      $('#mealGenForm').addEventListener('submit', (e) => { e.preventDefault(); mealGen.seen = []; generateMeal(); });
+      $('#menuUpload').addEventListener('change', (e) => scanMenu(e.target));
+      loadHostelMenu();
       $('#scanStart').onclick = startScanner;
       $('#scanStop').onclick = stopScanner;
       $$('[data-vision]').forEach((inp) => inp.addEventListener('change', () => runVision(inp)));
@@ -510,14 +504,8 @@ const views = {
     const slider = (name, label, min, max, step, val, unit) => `<div class="slider">
       <div class="flex justify-between text-xs"><label for="s-${name}" class="font-semibold text-gray-600">${label}</label><b id="o-${name}" class="text-gray-900"></b></div>
       <input id="s-${name}" name="${name}" type="range" min="${min}" max="${max}" step="${step}" value="${val}" data-unit="${unit}"></div>`;
-    const timeline = fit.workout_fuel.map((s) => `<li class="tl-item">
-      <span class="tl-dot">${s.icon}</span>
-      <div><p class="text-[0.7rem] font-bold text-teal-700 uppercase tracking-wide">${esc(s.when)}</p>
-      <p class="font-semibold text-gray-900">${esc(s.title)}</p>
-      <p class="text-xs text-gray-500">${esc(s.target)}</p>
-      <div class="mt-1">${s.foods.map((f) => pill(f, 'bg-gray-50 text-gray-600')).join('')}</div></div></li>`).join('');
     return { title: 'Fitness Nutrition', html: `
-      ${seg('fit', [['calc', '🧮 TDEE Calculator'], ['fuel', '⚡ Workout Fuel'], ['log', '📒 Food Log']], 'calc')}
+      ${seg('fit', [['calc', '🧮 TDEE Calculator'], ['log', '📒 Today’s Food Log']], 'calc')}
       ${pane('fit', 'calc', 'calc', `
         <form id="fitForm" class="box space-y-3">
           ${slider('weight', 'Weight', 30, 150, 0.5, i.weight, 'kg')}
@@ -532,7 +520,6 @@ const views = {
         <div id="fitResult"></div>
         <button type="button" id="fitSave" class="btn-primary w-full">💾 Save as my daily target</button>
         <p class="text-[0.7rem] text-gray-400 font-mono">BMR = 10·W + 6.25·H − 5·A + s (s = +5 ♂ / −161 ♀) · TDEE = BMR × activity</p>`)}
-      ${pane('fit', 'fuel', 'calc', `<p class="text-xs text-gray-500">Timed for a ${i.weight} kg body. Shift the whole timeline with your workout time.</p><ol class="timeline">${timeline}</ol>`)}
       ${pane('fit', 'log', 'calc', '<div id="foodLog"><p class="text-gray-400 text-xs">Loading…</p></div>')}`,
     after() {
       $('#fitForm').addEventListener('input', renderFitness);
@@ -545,35 +532,27 @@ const views = {
   // ---------------- HEALTH & RECOVERY ----------------
   async recovery() {
     const labs = await api('/api/labs');
-    const last = Object.fromEntries(labs.observations.map((o) => [o.metric, o]));
-    const field = (key, label, unit, step) => {
-      const prev = last[labs.metrics[key].metric];
-      return `<div class="field"><label>${label} <span class="font-normal text-gray-400">${unit}</span></label>
-        <input name="${key}" type="number" min="0" step="${step}" value="${prev ? esc(prev.value) : ''}" placeholder="—"></div>`;
-    };
+    const prev = labs.observations.length
+      ? `<p class="text-[0.7rem] text-gray-500">Last saved: ${labs.observations.map((o) => `${esc(o.metric)} ${esc(o.value)} ${esc(o.unit)} (${esc(o.status)})`).join(' · ')}</p>` : '';
     return { title: 'Health & Recovery', html: `
-      ${seg('health', [['lab', '🧪 Lab Analyzer'], ['roadmap', '🗓️ Recovery Roadmap'], ['cond', '⚕️ Conditions']], 'lab')}
+      ${seg('health', [['lab', '🧪 Lab Analyzer'], ['roadmap', '🗓️ Illness Roadmap'], ['cond', '⚕️ Conditions']], 'lab')}
       ${pane('health', 'lab', 'lab', `
-        <form id="labForm" class="box space-y-2">
-          <p class="text-xs text-gray-500">Enter values from your blood report — get a status and food-first fixes for your diet type. Readings are saved to your history.</p>
-          <div class="grid grid-cols-2 gap-2">
-            ${field('b12', 'Vitamin B12', 'pg/mL', 1)}
-            ${field('ferritin', 'Iron (Ferritin)', 'ng/mL', 0.1)}
-            ${field('vitamin_d', 'Vitamin D', 'ng/mL', 0.1)}
-            ${field('hemoglobin', 'Hemoglobin', 'g/dL', 0.1)}
-          </div>
-          <button class="btn-primary w-full">Analyze my labs</button>
-        </form>
+        <div class="box space-y-2">
+          <p class="font-semibold text-gray-900">🧪 Upload Lab Report</p>
+          <p class="text-xs text-gray-500">Take a clear photo of your blood test report. Gemini Vision extracts <b>Vitamin B12</b>, <b>Vitamin D</b> and <b>Iron</b> (ferritin / serum iron / haemoglobin), then you get a status and food fixes for your diet type.</p>
+          <label class="upload-btn"><input type="file" accept="image/*" capture="environment" id="labUpload" hidden>📄 Upload Lab Report (Image)</label>
+          ${prev}
+        </div>
         <div id="labResult" class="space-y-2"></div>`)}
       ${pane('health', 'roadmap', 'lab', `
-        ${seg('rplan', [['viral_fever', '🤒 Viral Fever'], ['dengue', '🦟 Dengue']], 'viral_fever')}
+        ${seg('rplan', [['viral_cold', '🤒 Viral Fever & Cold'], ['food_poisoning', '🤢 Food Poisoning']], 'viral_cold')}
         <div id="roadmap"><p class="text-xs text-gray-400">Loading…</p></div>`)}
       ${pane('health', 'cond', 'lab', '<div id="condBox"><p class="text-xs text-gray-400">Loading…</p></div>')}
       <p class="text-xs text-gray-400">General dietary guidance only — not a substitute for medical diagnosis or treatment.</p>`,
     after() {
-      $('#labForm').addEventListener('submit', analyzeLabs);
+      $('#labUpload').addEventListener('change', (e) => uploadLabReport(e.target));
       $('[data-seg="rplan"]').addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) loadRoadmap(b.dataset.tab); });
-      loadRoadmap('viral_fever');
+      loadRoadmap('viral_cold');
       loadConditions();
     } };
   },
@@ -623,40 +602,59 @@ const views = {
     } };
   },
 
-  // ---------------- ANALYTICS ----------------
+  // ---------------- ANALYTICS: Micronutrient Gap Dashboard ----------------
   async analytics() {
     const a = await api('/api/analytics');
-    const color = (p) => (p < 50 ? '#ef4444' : p < 80 ? '#f59e0b' : '#22c55e');
-    return { title: 'Nutrition Analytics', html: `
-      <div class="box"><p class="font-semibold text-gray-900 mb-2">📅 Last 7 days — calories logged</p><div class="h-48"><canvas id="weekChart"></canvas></div></div>
-      <p class="text-xs text-gray-500">${esc(a.note)}</p>
-      <div class="box"><div class="h-60"><canvas id="gapChart"></canvas></div></div>
-      ${a.gaps.map((g) => `<div class="box">
-        <div class="flex items-center justify-between gap-2"><p class="font-semibold text-gray-900">${esc(g.label)}</p><span class="text-xs font-bold" style="color:${color(g.pct)}">${g.pct}%</span></div>
-        <p class="text-xs text-gray-500">You: <b>${esc(g.actual)}</b> · Target: <b>${esc(g.target)}</b> ${esc(g.unit)}</p>
-        <div class="h-1.5 rounded-full bg-gray-100 mt-1.5 overflow-hidden"><div class="h-full rounded-full" style="width:${g.pct}%;background:${color(g.pct)}"></div></div>
-        <p class="text-xs mt-2">${esc(g.why)}</p><p class="text-xs mt-1 text-teal-800">✅ ${esc(g.fix)}</p>
-      </div>`).join('')}
-      ${a.observations.length ? `<div class="box"><p class="font-semibold text-gray-900 mb-1">🧪 Your latest lab results</p><div class="overflow-x-auto"><table class="tbl"><tr><th>Metric</th><th>Value</th><th>Ref</th><th></th></tr>
-        ${a.observations.map((o) => `<tr><td>${esc(o.metric)}</td><td>${esc(o.value)} ${esc(o.unit)}</td><td class="text-gray-400">${esc(o.reference_range)}</td><td>${pill(o.status, STATUS_CLS[o.status])}</td></tr>`).join('')}</table></div></div>` : ''}`,
+    const RISK = {
+      High: { cls: 'risk-high', color: '#dc2626' }, Moderate: { cls: 'risk-mod', color: '#d97706' },
+      Low: { cls: 'risk-low', color: '#059669' }, 'No data': { cls: 'risk-none', color: '#9ca3af' },
+    };
+    const hasData = a.days_logged > 0;
+    const card = (m) => {
+      const r = RISK[m.risk] || RISK['No data'];
+      const width = Math.min(100, m.pct);
+      return `<div class="box gap-card">
+        <div class="flex items-start justify-between gap-2">
+          <div class="min-w-0"><p class="font-semibold text-gray-900">${esc(m.label)}</p>
+          <p class="text-xs text-gray-500">${hasData ? `<b class="text-gray-900">${esc(m.value)}</b> ${esc(m.unit)}` : 'No data'} · target ${esc(m.target_text)}</p></div>
+          <span class="risk-badge ${r.cls}">${esc(m.risk)}${m.risk === 'No data' ? '' : ' risk'}</span>
+        </div>
+        ${hasData ? `<div class="flex items-center gap-2 mt-2"><div class="flex-1 h-1.5 rounded-full bg-gray-100 overflow-hidden"><div class="h-full rounded-full" style="width:${width}%;background:${r.color}"></div></div><span class="text-[0.7rem] font-semibold tabular-nums" style="color:${r.color}">${m.pct}%</span></div>` : ''}
+        ${m.detail && hasData ? `<p class="text-[0.7rem] text-gray-500 mt-1">${esc(m.detail)}</p>` : ''}
+        ${m.lab ? `<p class="text-[0.7rem] text-red-700 mt-1">🧪 Lab: ${esc(m.lab)}</p>` : ''}
+        <p class="text-xs mt-2 text-gray-700"><b>Clinical recommendation:</b> ${esc(m.recommendation)}</p>
+        ${m.sources?.length ? `<p class="text-[0.7rem] text-gray-400 mt-1">Top sources in your log: ${m.sources.map(esc).join(', ')}</p>` : ''}
+      </div>`;
+    };
+    return { title: 'Micronutrient Gap Dashboard', html: `
+      <div class="box">
+        <div class="flex items-center justify-between gap-2"><p class="font-semibold text-gray-900">🩺 % of daily requirement</p>
+        <p class="text-[0.7rem] text-gray-500">${a.days_logged}/${a.window_days} days · ${a.items_logged} foods</p></div>
+        ${hasData ? `<div class="flex gap-2 mt-2 text-xs">${pill(`${a.summary.high} high risk`, 'bg-red-50 text-red-700')}${pill(`${a.summary.moderate} moderate`, 'bg-amber-50 text-amber-800')}</div>
+          <div class="h-72 mt-1"><canvas id="gapRadar" aria-label="Radar chart of micronutrient adequacy"></canvas></div>`
+          : '<p class="text-xs text-gray-500 py-6 text-center">No food logged in the last 7 days. <button type="button" data-view="diet" class="text-teal-700 underline">Log meals in the Diet Planner</button> to see your gaps.</p>'}
+      </div>
+      ${a.metrics.map(card).join('')}
+      <p class="text-[0.7rem] text-gray-400">${esc(a.note)} Not a diagnosis — confirm deficiencies with a blood test.</p>`,
     after() {
-      makeChart('week', $('#weekChart'), {
-        type: 'bar',
+      if (!hasData) return;
+      const pts = a.metrics.map((m) => Math.min(150, m.pct));
+      makeChart('gapRadar', $('#gapRadar'), {
+        type: 'radar',
         data: {
-          labels: a.weekly.map((w) => new Date(`${w.date}T00:00`).toLocaleDateString('en-IN', { weekday: 'short' })),
+          labels: a.metrics.map((m) => m.label.replace(' (Bioavailable)', ' (abs.)')),
           datasets: [
-            { type: 'bar', label: 'Calories', data: a.weekly.map((w) => w.kcal), backgroundColor: '#2fbf71', borderRadius: 6, maxBarThickness: 28 },
-            { type: 'line', label: 'Target', data: a.weekly.map(() => a.target_kcal), borderColor: '#9ca3af', borderDash: [4, 4], pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Your intake', data: pts, backgroundColor: 'rgba(20,184,166,0.18)', borderColor: '#0d9488', borderWidth: 2,
+              pointBackgroundColor: a.metrics.map((m) => (RISK[m.risk] || RISK['No data']).color), pointRadius: 4 },
+            { label: 'Requirement (100%)', data: a.metrics.map(() => 100), borderColor: '#9ca3af', borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, fill: false },
           ],
         },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
-          scales: { x: { grid: { display: false } }, y: { beginAtZero: true, grid: { color: '#f1f5f9' } } } },
-      });
-      makeChart('gaps', $('#gapChart'), {
-        type: 'bar',
-        data: { labels: a.gaps.map((g) => g.label), datasets: [{ data: a.gaps.map((g) => g.pct), backgroundColor: a.gaps.map((g) => color(g.pct)), borderRadius: 6, barThickness: 16 }] },
-        options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
-          scales: { x: { min: 0, max: 100, ticks: { callback: (v) => `${v}%` }, grid: { color: '#f1f5f9' } }, y: { grid: { display: false } } } },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } },
+            tooltip: { callbacks: { label: (ctx) => (ctx.datasetIndex ? 'Requirement: 100%' : `${a.metrics[ctx.dataIndex].label}: ${a.metrics[ctx.dataIndex].pct}% · ${a.metrics[ctx.dataIndex].risk} risk`) } } },
+          scales: { r: { min: 0, max: 150, ticks: { stepSize: 50, callback: (v) => `${v}%`, backdropColor: 'transparent', font: { size: 9 } }, pointLabels: { font: { size: 10 } }, grid: { color: '#e5e7eb' } } },
+        },
       });
     } };
   },
@@ -746,26 +744,118 @@ const views = {
 };
 
 // ===================================================================
-// Diet: hostel recipes, barcode scanner, AI vision, manual log, chai timer
+// Diet: AI meal generator, hostel menu (saved list), barcode scanner, AI vision, manual log
 // ===================================================================
-async function loadHostel(filter) {
-  const box = $('#hostelList');
-  if (!box) return;
-  box.innerHTML = '<p class="text-gray-400 text-xs">Loading recipes…</p>';
-  const qs = filter === 'kettle' ? '?kettle_only=true' : filter === 'all' ? '?appliances=kettle,induction' : '';
+const mealGen = { seen: [], busy: false };
+async function generateMeal() {
+  if (mealGen.busy) return;
+  const form = $('#mealGenForm');
+  const box = $('#mealGenResult');
+  if (!form || !box) return;
+  mealGen.busy = true;
+  const req = Object.fromEntries(new FormData(form));
+  box.innerHTML = '<div class="box flex items-center gap-2 text-xs text-gray-500"><span class="spinner"></span> Planning your meal…</div>';
+  $$('#mealGenBtn, #mealNextBtn').forEach((b) => { b.disabled = true; });
   try {
-    const { hostel_optimizer: h } = await api(`/api/diet-planner${qs}`);
-    const icon = { none: '🥄 No-cook', kettle: '🫖 Kettle', induction: '🍳 Induction' };
-    box.innerHTML = `<p class="text-xs text-gray-500 mb-2">Appliances: <b>${h.appliances.map(esc).join(', ')}</b> · ${h.recipes.length} recipes · up to ${h.daily_protein_if_all} g protein</p>`
-      + h.recipes.map((r) => `<div class="box mb-2">
-        <div class="flex justify-between gap-2"><p class="font-semibold text-gray-900">${esc(r.name)}</p>${pill(icon[r.appliance] || r.appliance, 'bg-sky-50 text-sky-700')}</div>
-        <p class="text-xs text-gray-500">${r.prep_min} min · ${r.kcal} kcal · <b class="text-emerald-700">${r.protein_g} g protein</b> · ₹${r.cost_inr}</p>
-        <p class="text-xs mt-1">${r.ingredients.map(esc).join(' · ')}</p>
-        <div class="flex items-end justify-between gap-2 mt-1"><p class="text-xs text-gray-600">${esc(r.steps)}</p>
-        ${logBtn({ name: r.name, quantity: '1 serving', kcal: r.kcal, protein_g: r.protein_g, carbs_g: r.carbs_g, fat_g: r.fat_g, source: 'recipe' })}</div>
-      </div>`).join('');
+    const r = await post('/api/generate-meal', { ...req, exclude: mealGen.seen });
+    const m = r.meal;
+    mealGen.seen.push(m.name);
+    box.innerHTML = `<div class="box meal-card">
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0"><p class="text-[0.7rem] font-bold text-teal-700 uppercase tracking-wide">${esc(r.request.meal_type)} · ${esc(r.request.cuisine)} · ${esc(r.request.diet)}</p>
+        <p class="font-semibold text-gray-900 text-base leading-tight mt-0.5">${esc(m.name)}</p></div>
+        ${r.source === 'gemini' ? pill('Gemini', 'bg-violet-50 text-violet-700') : pill('offline pick', 'bg-amber-50 text-amber-800')}
+      </div>
+      ${m.description ? `<p class="text-xs text-gray-500 mt-1">${esc(m.description)}</p>` : ''}
+      <div class="grid grid-cols-4 gap-1.5 text-center mt-3">
+        <div class="rounded-xl p-2 bg-emerald-50"><b class="tabular-nums">${fmt(m.kcal)}</b><div class="text-[0.65rem]">kcal</div></div>
+        <div class="rounded-xl p-2 bg-emerald-50"><b class="tabular-nums">${Math.round(m.protein_g)} g</b><div class="text-[0.65rem]">Protein</div></div>
+        <div class="rounded-xl p-2 bg-blue-50"><b class="tabular-nums">${Math.round(m.carbs_g)} g</b><div class="text-[0.65rem]">Carbs</div></div>
+        <div class="rounded-xl p-2 bg-amber-50"><b class="tabular-nums">${Math.round(m.fat_g)} g</b><div class="text-[0.65rem]">Fat</div></div>
+      </div>
+      <p class="text-[0.7rem] text-gray-500 mt-1.5">Fibre ${m.fiber_g} g · ${esc(m.quantity)} · ~${m.prep_min} min · your target for this meal ≈ ${fmt(r.target.kcal)} kcal / ${r.target.protein_g} g protein</p>
+      ${m.ingredients.length ? `<p class="text-xs font-semibold text-gray-700 mt-2">Ingredients</p><ul class="list-disc pl-5 text-xs space-y-0.5">${m.ingredients.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
+      ${m.why ? `<p class="text-xs bg-teal-50 text-teal-900 rounded-lg p-2 mt-2">💡 ${esc(m.why)}</p>` : ''}
+      <div class="flex gap-2 mt-3">
+        <button type="button" id="mealNextBtn" class="btn-ghost flex-1">🔄 Next Suggestion</button>
+        ${logBtn({ name: m.name, quantity: m.quantity, kcal: m.kcal, protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g, source: 'meal_plan' }, '+ Log meal')}
+      </div></div>`;
+    $('#mealNextBtn').onclick = generateMeal;
   } catch (e) {
-    box.innerHTML = `<p class="text-red-600 text-xs">${esc(e.message)}</p>`;
+    box.innerHTML = `<p class="text-xs text-red-600">${esc(e.message)}</p>`;
+  } finally {
+    mealGen.busy = false;
+    $$('#mealGenBtn, #mealNextBtn').forEach((b) => { b.disabled = false; });
+  }
+}
+
+const MEAL_ORDER = { breakfast: 0, lunch: 1, snacks: 2, dinner: 3, any: 4 };
+function renderHostelMenu(items) {
+  const box = $('#hostelMenu');
+  if (!box) return;
+  if (!items.length) {
+    box.innerHTML = '<div class="box text-center text-xs text-gray-400 py-6">No saved menu yet — upload a photo of your mess menu above.</div>';
+    return;
+  }
+  const sorted = [...items].sort((a, b) => (MEAL_ORDER[a.meal] ?? 4) - (MEAL_ORDER[b.meal] ?? 4) || a.id - b.id);
+  box.innerHTML = `<div class="box">
+    <div class="flex items-center justify-between gap-2 mb-1">
+      <p class="font-semibold text-gray-900">🏫 My saved menu <span class="text-xs font-normal text-gray-400">· ${items.length} item(s)</span></p>
+      <button type="button" id="menuClear" class="text-xs text-gray-400 underline">Clear all</button>
+    </div>
+    ${sorted.map((it) => `<div class="flex items-center gap-2 py-2 border-t border-gray-50">
+      <input type="checkbox" class="menu-check" value="${it.id}" aria-label="Select ${esc(it.name)}">
+      <div class="flex-1 min-w-0"><p class="font-medium text-gray-900 leading-tight">${esc(it.name)}
+        <span class="text-xs font-normal text-gray-400">${esc(it.quantity || '')}${it.meal && it.meal !== 'any' ? ` · ${esc(it.meal)}` : ''}</span></p>
+        <p class="text-[0.7rem] text-gray-500">${macroLine(it)}${it.tip ? ` · <span class="text-teal-700">${esc(it.tip)}</span>` : ''}</p></div>
+      <button type="button" class="del-btn" data-menu-del="${it.id}" aria-label="Delete ${esc(it.name)}">Delete</button>
+    </div>`).join('')}
+    <button type="button" id="menuAdd" class="btn-primary w-full mt-2">+ Add to Dashboard</button>
+  </div>`;
+  $$('[data-menu-del]', box).forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      const r = await api(`/api/hostel-menu/${b.dataset.menuDel}`, { method: 'DELETE' });
+      renderHostelMenu(r.items);
+    } catch (e) { toast(`⚠️ ${e.message}`); b.disabled = false; }
+  }));
+  $('#menuClear').onclick = async () => {
+    if (!confirm('Delete every saved menu item?')) return;
+    try { renderHostelMenu((await api('/api/hostel-menu', { method: 'DELETE' })).items); } catch (e) { toast(`⚠️ ${e.message}`); }
+  };
+  $('#menuAdd').onclick = async (e) => {
+    const ids = $$('.menu-check', box).filter((c) => c.checked).map((c) => Number(c.value));
+    if (!ids.length) return toast('Tick the dishes you ate, then add them');
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const r = await post('/api/hostel-menu/log', { ids });
+      toast(`✅ Added ${r.logged.length} item(s) — today ${fmt(r.totals.calories)} kcal`);
+      $$('.menu-check', box).forEach((c) => { c.checked = false; });
+      await loadDashboard();
+    } catch (err) { toast(`⚠️ ${err.message}`); }
+    btn.disabled = false;
+  };
+}
+async function loadHostelMenu() {
+  try { renderHostelMenu((await api('/api/hostel-menu')).items); } catch (e) {
+    if ($('#hostelMenu')) $('#hostelMenu').innerHTML = `<p class="text-xs text-red-600">${esc(e.message)}</p>`;
+  }
+}
+async function scanMenu(input) {
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  const status = $('#menuScanStatus');
+  status.innerHTML = '<div class="flex items-center gap-2 text-xs text-gray-500"><span class="spinner"></span> AI is reading your menu…</div>';
+  try {
+    const r = await post('/api/hostel-menu/scan', { image: await fileToDataURL(file) });
+    status.innerHTML = r.added.length
+      ? `<p class="text-xs text-emerald-700 bg-emerald-50 rounded-lg p-2">✅ Saved ${r.added.length} dish(es) to your menu.${r.source === 'demo' ? ' (AI offline — sample menu.)' : ''}${r.notes ? ` ${esc(r.notes)}` : ''}</p>`
+      : `<p class="text-xs text-gray-500">${esc(r.notes)}</p>`;
+    renderHostelMenu(r.items);
+  } catch (e) {
+    status.innerHTML = `<p class="text-xs text-red-600">${esc(e.message)}</p>`;
   }
 }
 
@@ -866,30 +956,6 @@ async function runVision(input) {
   }
 }
 
-const chai = {
-  end: Number(store.get('np-chai-end')) || 0,
-  tick: null,
-  start(min) { this.end = Date.now() + min * 60000; store.set('np-chai-end', String(this.end)); this.render(min); toast(`☕ Chai timer started — wait ${min} minutes`); },
-  reset(min) { this.end = 0; store.set('np-chai-end', '0'); this.render(min); },
-  stop() { clearInterval(this.tick); },
-  render(min) {
-    clearInterval(this.tick);
-    const draw = () => {
-      const clock = $('#chaiClock');
-      if (!clock) return clearInterval(this.tick);
-      const left = Math.max(0, this.end - Date.now());
-      const total = this.end ? left : min * 60000;
-      clock.textContent = `${Math.floor(total / 60000)}:${String(Math.floor((total % 60000) / 1000)).padStart(2, '0')}`;
-      if (!this.end) { $('#chaiStatus').textContent = 'Start the timer when you finish an iron-rich meal.'; return; }
-      if (left > 0) { $('#chaiStatus').textContent = '🚫 Hold the chai — iron is still being absorbed.'; return; }
-      $('#chaiStatus').textContent = '✅ Chai time! Your iron has had time to absorb.';
-      clearInterval(this.tick);
-    };
-    draw();
-    if (this.end > Date.now()) this.tick = setInterval(draw, 1000);
-  },
-};
-
 // ===================================================================
 // Fitness: live Mifflin–St Jeor calculator (client-side), save, food log
 // ===================================================================
@@ -969,15 +1035,26 @@ async function renderFoodLog() {
 }
 
 // ===================================================================
-// Health & Recovery: lab analyzer, roadmap checklists, condition toggles
+// Health & Recovery: lab report upload, illness roadmap checklists, condition toggles
 // ===================================================================
-async function analyzeLabs(e) {
-  e.preventDefault();
-  const body = Object.fromEntries([...new FormData(e.target).entries()].filter(([, v]) => v !== ''));
+async function uploadLabReport(input) {
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
   const box = $('#labResult');
+  box.innerHTML = '<div class="box flex items-center gap-2 text-xs text-gray-500"><span class="spinner"></span> AI is reading your lab report…</div>';
   try {
-    const r = await post('/api/lab-analyze', body);
-    box.innerHTML = r.results.map((x) => `<div class="box">
+    const r = await post('/api/lab-report', { image: await fileToDataURL(file, 1800) });
+    box.innerHTML = `<div class="box">
+        <div class="flex items-center justify-between gap-2"><p class="font-semibold text-gray-900">📄 Extracted from your report</p>
+        ${r.source === 'demo' ? pill('AI offline — sample', 'bg-amber-50 text-amber-800') : pill('Gemini Vision', 'bg-violet-50 text-violet-700')}</div>
+        <div class="overflow-x-auto mt-1"><table class="tbl"><tr><th>Test</th><th>As printed</th><th>Normalised</th><th>Status</th></tr>
+        ${r.results.map((x, i) => `<tr><td>${esc(r.extracted[i]?.test || x.metric)}</td><td>${esc(r.extracted[i]?.as_printed || '')}</td><td>${esc(x.value)} ${esc(x.unit)}</td><td>${pill(x.status, STATUS_CLS[x.status])}</td></tr>`).join('')}</table></div>
+        ${r.report_date ? `<p class="text-[0.7rem] text-gray-400 mt-1">Report date: ${esc(r.report_date)}</p>` : ''}
+        ${r.notes ? `<p class="text-[0.7rem] text-gray-500 mt-1">${esc(r.notes)}</p>` : ''}
+        <p class="text-[0.7rem] text-gray-400 mt-1">Check these against your report — saved to your history.</p>
+      </div>`
+      + r.results.map((x) => `<div class="box">
       <div class="flex items-center justify-between gap-2"><p class="font-semibold text-gray-900">${esc(x.metric)}</p>${pill(x.status, STATUS_CLS[x.status])}</div>
       <p class="text-xs text-gray-500">${esc(x.value)} ${esc(x.unit)} · reference ${esc(x.reference_range)}</p>
       <p class="text-xs font-semibold text-gray-700 mt-2">🍽️ Food fix (${esc(r.diet_type)})</p>
@@ -990,54 +1067,50 @@ async function analyzeLabs(e) {
   }
 }
 
-const roadmapState = { plan: 'viral_fever', data: null, day: 1 };
+const roadmapState = { plan: 'viral_cold', data: null };
 async function loadRoadmap(plan) {
   roadmapState.plan = plan;
   const box = $('#roadmap');
   if (!box) return;
+  box.innerHTML = '<p class="text-xs text-gray-400">Loading…</p>';
   try {
     roadmapState.data = await api(`/api/recovery/${plan}`);
-    const done = doneSet();
-    const firstOpen = roadmapState.data.days.find((d) => d.items.some((_, i) => !done.has(`${d.day}:${i}`)));
-    roadmapState.day = firstOpen?.day || 14;
     renderRoadmap();
   } catch (e) { box.innerHTML = `<p class="text-xs text-red-600">${esc(e.message)}</p>`; }
 }
-const doneSet = () => new Set(roadmapState.data.checks.map((c) => `${c.day}:${c.item}`));
 function renderRoadmap() {
   const d = roadmapState.data;
-  const done = doneSet();
-  const total = d.days.reduce((s, x) => s + x.items.length, 0);
+  const done = new Set(d.checks.map((c) => `${c.day}:${c.item}`));
+  const total = d.phases.reduce((s, p) => s + p.items.length, 0);
   const pct = Math.round((done.size / total) * 100);
-  const day = d.days[roadmapState.day - 1];
   const tex = { liquid: '💧', 'semi-solid': '🥣', solid: '🍛' };
   $('#roadmap').innerHTML = `
     <p class="text-xs bg-red-50 text-red-700 rounded-lg p-2">⚠️ ${esc(d.warning)}</p>
     <div class="flex items-center gap-2 mt-3"><div class="flex-1 h-2 rounded-full bg-gray-100 overflow-hidden"><div class="h-full bg-teal-500 rounded-full" style="width:${pct}%"></div></div><span class="text-xs font-semibold text-gray-700">${pct}%</span></div>
-    <div class="day-grid mt-3">${d.days.map((x) => {
-      const n = x.items.filter((_, i) => done.has(`${x.day}:${i}`)).length;
-      const cls = n === x.items.length ? 'full' : n ? 'part' : '';
-      return `<button type="button" class="day-chip ${cls} ${x.day === roadmapState.day ? 'sel' : ''}" data-day="${x.day}">D${x.day}<small>${tex[x.texture]}</small></button>`;
-    }).join('')}</div>
-    <div class="box mt-3">
-      <p class="font-semibold text-gray-900">Day ${day.day} · ${esc(day.phase)}</p>
-      <p class="text-xs text-gray-500 mb-2">${tex[day.texture]} ${esc(day.texture)} · ${esc(day.goal)}</p>
-      ${day.items.map((it, i) => `<label class="check-row"><input type="checkbox" data-item="${i}" ${done.has(`${day.day}:${i}`) ? 'checked' : ''}><span>${esc(it)}</span></label>`).join('')}
-    </div>
-    <button type="button" id="roadReset" class="text-xs text-gray-400 underline">Reset ${esc(d.condition)} progress</button>`;
-  $$('#roadmap [data-day]').forEach((b) => b.addEventListener('click', () => { roadmapState.day = Number(b.dataset.day); renderRoadmap(); }));
+    ${d.phases.map((p) => {
+      const n = p.items.filter((_, i) => done.has(`${p.from}:${i}`)).length;
+      return `<div class="box mt-3 phase-card">
+        <div class="flex items-center justify-between gap-2">
+          <p class="font-semibold text-gray-900">${tex[p.texture] || ''} Day ${p.from}–${p.to} · ${esc(p.name)}</p>
+          <span class="text-[0.7rem] font-semibold ${n === p.items.length ? 'text-emerald-700' : 'text-gray-400'}">${n}/${p.items.length}</span>
+        </div>
+        <p class="text-xs text-gray-500 mb-1">${esc(p.goal)}</p>
+        ${p.items.map((it, i) => `<label class="check-row"><input type="checkbox" data-phase="${p.from}" data-item="${i}" ${done.has(`${p.from}:${i}`) ? 'checked' : ''}><span>${esc(it)}</span></label>`).join('')}
+      </div>`;
+    }).join('')}
+    <button type="button" id="roadReset" class="text-xs text-gray-400 underline mt-2">Reset ${esc(d.condition)} progress</button>`;
   $$('#roadmap [data-item]').forEach((c) => c.addEventListener('change', async () => {
     try {
-      const r = await post(`/api/recovery/${roadmapState.plan}/check`, { day: roadmapState.day, item: Number(c.dataset.item), done: c.checked });
+      const r = await post(`/api/recovery/${roadmapState.plan}/check`, { day: Number(c.dataset.phase), item: Number(c.dataset.item), done: c.checked });
       roadmapState.data.checks = r.checks;
       renderRoadmap();
     } catch (e) { toast(`⚠️ ${e.message}`); c.checked = !c.checked; }
   }));
   $('#roadReset').onclick = async () => {
-    const r = await post(`/api/recovery/${roadmapState.plan}/check`, { reset: true });
-    roadmapState.data.checks = r.checks;
-    roadmapState.day = 1;
-    renderRoadmap();
+    try {
+      roadmapState.data.checks = (await post(`/api/recovery/${roadmapState.plan}/check`, { reset: true })).checks;
+      renderRoadmap();
+    } catch (e) { toast(`⚠️ ${e.message}`); }
   };
 }
 
@@ -1179,7 +1252,7 @@ function renderChat() {
   $('#sheetBody').innerHTML = chatLog.length
     ? chatLog.map((m) => `<div class="flex ${m.role === 'user' ? 'justify-end' : ''}"><div class="${m.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'} rounded-2xl px-3 py-2 max-w-[85%] whitespace-pre-wrap">${esc(m.text)}</div></div>`).join('')
     : `<p class="text-gray-400">Try one of these:</p>
-       ${['I live in a hostel with only a kettle — how do I get 80g protein?', 'Why am I still anaemic even though I eat palak?', 'What should I eat on day 5 of dengue?']
+       ${['I live in a hostel with only a kettle — how do I get 80g protein?', 'Why am I still anaemic even though I eat palak?', 'What should I eat on day 2 of food poisoning?']
         .map((q) => `<button type="button" class="chat-suggest block w-full text-left bg-gray-50 hover:bg-teal-50 rounded-xl px-3 py-2 text-gray-700">${esc(q)}</button>`).join('')}`;
   $('#sheetBody').scrollTop = $('#sheetBody').scrollHeight;
 }
@@ -1249,7 +1322,7 @@ async function boot() {
 setTimeout(() => { if (!screenShown()) { console.warn('Boot stalled — showing login'); showAuth(); } }, 8000);
 
 fetch('/api/health').then((r) => r.json()).then((h) => {
-  $('#statusLine').innerHTML = `DB: SQLite<br>AI: ${h.ai === 'gemini' ? 'Gemini' : 'offline demo'}<br>Auth: ${h.auth === 'firebase' ? 'Google' : 'demo'} · Mail: ${h.email === 'smtp' ? 'SMTP' : 'log only'}`;
+  $('#statusLine').innerHTML = `DB: ${h.status === 'ok' ? 'Postgres (Neon)' : 'unreachable'}<br>AI: ${h.ai === 'gemini' ? 'Gemini' : 'offline demo'}<br>Auth: ${h.auth === 'firebase' ? 'Google' : 'demo'} · Mail: ${h.email === 'smtp' ? 'SMTP' : 'log only'}`;
 }).catch(() => { $('#statusLine').textContent = 'Server unreachable'; });
 
 boot().catch((e) => { console.error('Boot failed', e); showAuth(); });

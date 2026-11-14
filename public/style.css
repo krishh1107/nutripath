@@ -291,3 +291,14 @@ body.is-desktop .sidebar-status { margin-top: auto; padding: 12px 14px; font-siz
 body.is-desktop .toast { bottom: 32px; }
 
 [hidden] { display: none !important; }
+
+/* Smart local swaps reference table */
+.swap-tbl tr:not(.swap-why) td { border-bottom: 0; padding-bottom: 2px; }
+.swap-tbl .swap-why td { font-size: 0.7rem; color: #0f766e; padding-top: 0; padding-bottom: 8px; }
+
+/* Micronutrient Gap Dashboard risk badges */
+.risk-badge { flex-shrink: 0; border-radius: 9999px; padding: 2px 10px; font-size: 0.7rem; font-weight: 700; white-space: nowrap; }
+.risk-high { background: #fee2e2; color: #b91c1c; }
+.risk-mod { background: #fef3c7; color: #92400e; }
+.risk-low { background: #d1fae5; color: #065f46; }
+.risk-none { background: #f3f4f6; color: #6b7280; }

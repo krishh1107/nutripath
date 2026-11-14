@@ -161,6 +161,8 @@ const db = {
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
     [userId, date, m.name, m.quantity ?? null, m.kcal, m.protein_g, m.carbs_g, m.fat_g, m.source, m.barcode ?? null],
   ),
+  // All food logged on or after a date (micronutrient analytics)
+  mealsSince: (userId, fromDate) => query('SELECT * FROM meal_logs WHERE user_id = $1 AND log_date >= $2 ORDER BY log_date, id', [userId, fromDate]),
   listMeals: (userId, date = today()) => query('SELECT * FROM meal_logs WHERE user_id = $1 AND log_date = $2 ORDER BY id', [userId, date]),
   deleteMeal: async (userId, id) => (await getPool().query('DELETE FROM meal_logs WHERE id = $1 AND user_id = $2', [id, userId])).rowCount > 0,
   async mealTotals(userId, date = today()) {
@@ -183,6 +185,23 @@ const db = {
   // ----- meal_plans -----
   saveMealPlan: (userId, focus, meals, totalKcal) => query('INSERT INTO meal_plans (user_id, focus, meals, total_kcal) VALUES ($1, $2, $3, $4)',
     [userId, focus, JSON.stringify(meals), totalKcal]),
+
+  // ----- hostel_menus -----
+  listHostelMenu: (userId) => query('SELECT * FROM hostel_menus WHERE user_id = $1 ORDER BY id', [userId]),
+  async addHostelMenuItems(userId, items) {
+    const added = [];
+    for (const it of items) { // sequential: keeps menu order
+      added.push(await one(
+        `INSERT INTO hostel_menus (user_id, name, meal, quantity, kcal, protein_g, carbs_g, fat_g, tip)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [userId, it.name, it.meal ?? null, it.quantity ?? null, it.kcal, it.protein_g, it.carbs_g, it.fat_g, it.tip ?? null],
+      ));
+    }
+    return added;
+  },
+  getHostelMenuItems: (userId, ids) => query('SELECT * FROM hostel_menus WHERE user_id = $1 AND id = ANY($2::int[]) ORDER BY id', [userId, ids]),
+  deleteHostelMenuItem: async (userId, id) => (await getPool().query('DELETE FROM hostel_menus WHERE id = $1 AND user_id = $2', [id, userId])).rowCount > 0,
+  clearHostelMenu: async (userId) => (await getPool().query('DELETE FROM hostel_menus WHERE user_id = $1', [userId])).rowCount,
 
   // ----- chatbot_history -----
   addChatMessage: (userId, role, message) => query('INSERT INTO chatbot_history (user_id, role, message) VALUES ($1, $2, $3)', [userId, role, message]),
