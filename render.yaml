@@ -12,7 +12,9 @@ services:
     autoDeploy: true
     envVars:
       - key: DATABASE_URL
-        sync: false                  # Neon connection string
+        sync: false                  # Neon POOLED string (host has -pooler) for the app
+      - key: DATABASE_URL_UNPOOLED
+        sync: false                  # Neon DIRECT string, used by initDB.js for migrations
       - key: GEMINI_API_KEY
         sync: false
       - key: GMAIL_USER

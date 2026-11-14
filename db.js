@@ -1,10 +1,11 @@
-// Database layer: PostgreSQL via `pg` (Neon.tech in production, any Postgres locally).
-// Connects to $DATABASE_URL. Every method is async — callers must `await` them.
-// Schema + seed data are applied by initDB.js (`npm start` runs it before server.js).
+// Database layer: PostgreSQL via `pg` (Neon in production, any Postgres locally).
+// The app connects with $DATABASE_URL — Neon's *pooled* string (PgBouncer, "-pooler" host),
+// right for request traffic. initDB.js switches to $DATABASE_URL_UNPOOLED (direct) for
+// schema migrations, per Neon's guidance. Every method is async — callers must `await` them.
 const { Pool } = require('pg');
 
 const APP_TZ = process.env.APP_TZ || 'Asia/Kolkata';
-const DATABASE_URL = process.env.DATABASE_URL;
+let DATABASE_URL = process.env.DATABASE_URL;
 
 // YYYY-MM-DD for "today" (or another instant) in the app's timezone
 const dateIn = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: APP_TZ }).format(d);
@@ -27,8 +28,12 @@ function getPool() {
   if (!DATABASE_URL) {
     throw new Error('DATABASE_URL is not set. Add your Neon connection string to .env (see .env.example).');
   }
+  // Strip sslmode from the URL: pg lets it override the `ssl` option below
+  // (and warns that its meaning is changing), so TLS is configured in one place.
+  const url = new URL(DATABASE_URL);
+  url.searchParams.delete('sslmode');
   pool = new Pool({
-    connectionString: DATABASE_URL,
+    connectionString: url.toString(),
     ssl: sslConfig(DATABASE_URL),
     max: Number(process.env.PG_POOL_MAX || 5), // Neon free tier has a small connection budget
     idleTimeoutMillis: 30000,
@@ -85,6 +90,11 @@ const db = {
   getPool,
   describeError,
   async close() { if (pool) { await pool.end(); pool = null; } },
+  // Use a different connection string (call before the first query), e.g. the direct URL for migrations
+  useConnectionString(url) {
+    if (pool) throw new Error('useConnectionString must be called before the pool is created');
+    DATABASE_URL = url;
+  },
   // Host of the database (never the credentials), for /api/health
   getPath() {
     try { return new URL(DATABASE_URL).host; } catch { return '(DATABASE_URL not set)'; }

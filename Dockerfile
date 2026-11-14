@@ -8,7 +8,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY server.js db.js initDB.js auth.js mailer.js data.js schema.sql ./
+COPY server.js db.js initDB.js loadEnv.js auth.js mailer.js data.js schema.sql ./
 COPY public ./public
 
 # Run as the unprivileged "node" user that ships with the image

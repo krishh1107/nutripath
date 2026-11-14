@@ -1,9 +1,13 @@
-// Applies schema.sql (tables, indexes, seed data) to the Postgres database at $DATABASE_URL.
+// Applies schema.sql (tables, indexes, seed data) to the Postgres database.
 // Idempotent — safe to run on every deploy. `npm start` runs it before server.js.
-require('dotenv').config();
+// Migrations run over Neon's direct connection ($DATABASE_URL_UNPOOLED) when available,
+// since the pooled one (PgBouncer, transaction mode) doesn't keep session state.
+require('./loadEnv');
 const fs = require('fs');
 const path = require('path');
 const db = require('./db');
+
+if (process.env.DATABASE_URL_UNPOOLED) db.useConnectionString(process.env.DATABASE_URL_UNPOOLED);
 
 async function main() {
   const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
