@@ -1,0 +1,27 @@
+{
+  "name": "nutripath",
+  "version": "1.0.0",
+  "description": "NutriPath - AI-powered personalized nutrition platform (Express + PostgreSQL)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node initDB.js && node server.js",
+    "dev": "node --watch server.js",
+    "init-db": "node initDB.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^10.5.0",
+    "pg": "^8.23.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

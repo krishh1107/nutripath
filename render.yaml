@@ -1,0 +1,36 @@
+# Render Blueprint — NutriPath as a free Node web service backed by Neon PostgreSQL.
+# Usage: push this repo to GitHub, then Render Dashboard → New → Blueprint → select repo,
+# and paste your secrets (DATABASE_URL, GEMINI_API_KEY, GMAIL_*) when prompted.
+# Data lives in Neon, so Render's ephemeral free-tier disk no longer matters.
+services:
+  - type: web
+    name: nutripath
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start          # node initDB.js && node server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_TZ
+        value: Asia/Kolkata
+      - key: SESSION_SECRET
+        generateValue: true          # stable across restarts — keeps users signed in
+      - key: DATABASE_URL
+        sync: false                  # Neon connection string
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: GMAIL_USER
+        sync: false
+      - key: GMAIL_PASS
+        sync: false
+      - key: FIREBASE_API_KEY
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_APP_ID
+        sync: false
