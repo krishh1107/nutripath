@@ -144,6 +144,7 @@ async function signOut(expired = false) {
   state.guest = false;
   state.token = null;
   state.user = null;
+  journey.data = null;
   store.del('np-session');
   try { await fbAuth?.signOut(); } catch { /* ignore */ }
   closeSheet(true);
@@ -161,6 +162,7 @@ async function enterApp(user, needsOnboarding) {
   } catch (e) {
     console.error('Initial dashboard load failed', e);
   }
+  loadJourney(); // fills the My Journey cards; never blocks entry
   if (needsOnboarding) openOnboarding();
   const initialView = location.hash.slice(1);
   if (views[initialView]) showView(initialView);
@@ -1245,12 +1247,59 @@ document.addEventListener('submit', async (e) => {
 // ===================================================================
 // Chat
 // ===================================================================
+// Minimal, safe Markdown → HTML for AI replies: the text is escaped first, then only
+// headings, bullet/numbered lists, **bold**, *italic*/_italic_ and `code` are re-introduced.
+function inlineMd(s) {
+  return s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/__(.+?)__/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*(?!\s)([^*]+?)\*(?!\*)/g, '$1<em>$2</em>')
+    .replace(/(^|\W)_(?!\s)([^_]+?)_(?=\W|$)/g, '$1<em>$2</em>');
+}
+function renderMarkdown(text) {
+  const out = [];
+  let list = null; // { tag, items }
+  let para = [];
+  const flushPara = () => { if (para.length) out.push(`<p>${para.map(inlineMd).join('<br>')}</p>`); para = []; };
+  const flushList = () => {
+    if (list) out.push(`<${list.tag}>${list.items.map((i) => `<li${i.sub ? ' class="sub"' : ''}>${inlineMd(i.text)}</li>`).join('')}</${list.tag}>`);
+    list = null;
+  };
+  for (const raw of esc(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    const bullet = /^[-*•]\s+(.*)$/.exec(line);
+    const numbered = /^\d+[.)]\s+(.*)$/.exec(line);
+    const heading = /^#{1,6}\s+(.*)$/.exec(line);
+    if (/^([-*_])\1{2,}$/.test(line)) { flushPara(); flushList(); out.push('<hr>'); continue; }
+    if (bullet || numbered) {
+      flushPara();
+      const tag = bullet ? 'ul' : 'ol';
+      if (list?.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push({ text: (bullet || numbered)[1], sub: /^\s{2,}/.test(raw) && list.items.length > 0 });
+    } else if (heading) {
+      flushPara(); flushList(); out.push(`<h4>${inlineMd(heading[1])}</h4>`);
+    } else if (!line) {
+      flushPara(); flushList();
+    } else {
+      flushList(); para.push(line);
+    }
+  }
+  flushPara(); flushList();
+  return out.join('');
+}
+
 const chatLog = [];
 let chatLoaded = false;
+const TYPING = '<span class="typing" role="status" aria-label="NutriPath AI is typing"><i></i><i></i><i></i></span>';
+function chatBubble(m) {
+  if (m.role === 'user') return `<div class="flex justify-end"><div class="chat-bubble-user rounded-2xl px-3 py-2 max-w-[85%] whitespace-pre-wrap">${esc(m.text)}</div></div>`;
+  return `<div class="flex"><div class="chat-bubble-ai md rounded-2xl px-3 py-2 max-w-[85%]">${m.pending ? TYPING : renderMarkdown(m.text)}</div></div>`;
+}
 function renderChat() {
   if (state.view !== 'chat') return;
   $('#sheetBody').innerHTML = chatLog.length
-    ? chatLog.map((m) => `<div class="flex ${m.role === 'user' ? 'justify-end' : ''}"><div class="${m.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'} rounded-2xl px-3 py-2 max-w-[85%] whitespace-pre-wrap">${esc(m.text)}</div></div>`).join('')
+    ? chatLog.map(chatBubble).join('')
     : `<p class="text-gray-400">Try one of these:</p>
        ${['I live in a hostel with only a kettle — how do I get 80g protein?', 'Why am I still anaemic even though I eat palak?', 'What should I eat on day 2 of food poisoning?']
         .map((q) => `<button type="button" class="chat-suggest block w-full text-left bg-gray-50 hover:bg-teal-50 rounded-xl px-3 py-2 text-gray-700">${esc(q)}</button>`).join('')}`;
@@ -1259,7 +1308,7 @@ function renderChat() {
 document.addEventListener('click', (e) => { const s = e.target.closest('.chat-suggest'); if (s) sendChat(s.textContent); });
 
 async function sendChat(text) {
-  chatLog.push({ role: 'user', text }, { role: 'model', text: 'Thinking…' });
+  chatLog.push({ role: 'user', text }, { role: 'model', text: '', pending: true });
   const slot = chatLog[chatLog.length - 1];
   renderChat();
   try {
@@ -1268,8 +1317,189 @@ async function sendChat(text) {
   } catch (e) {
     slot.text = `⚠️ ${e.message}`;
   }
+  slot.pending = false;
   renderChat();
 }
+
+// ===================================================================
+// My Journey — gamified 7-day roadmap (GET /api/journey, POST /api/journey/complete)
+// ===================================================================
+const journey = { data: null, sel: null, busy: false, unlocked: null };
+const J_TOTAL = 7;
+const J_X = [50, 78, 28, 70, 26, 72, 46]; // node x in % of the map width (snaking path)
+const jY = (i) => 80 + i * 115;           // node y in px
+
+function journeyState(day, current) {
+  if (day < current) return 'done';
+  if (day === current) return 'active';
+  if (day === current + 1) return 'next';
+  return 'locked';
+}
+
+// Home card + sidebar card: "Day X of 7" and a progress meter
+function renderJourneyCta() {
+  const cur = journey.data?.current_day || 1;
+  const finished = cur > J_TOTAL;
+  $$('.journey-cta-sub').forEach((el) => { el.textContent = finished ? '7-day roadmap complete 🏆' : `7-day food roadmap · Day ${cur} of ${J_TOTAL}`; });
+  $$('.journey-cta-fill').forEach((el) => { el.style.width = `${Math.round(((cur - 1) / J_TOTAL) * 100)}%`; });
+}
+
+async function loadJourney() {
+  if (state.guest) return null;
+  try { journey.data = await api('/api/journey'); } catch (e) { console.warn('Journey load failed', e.message); }
+  renderJourneyCta();
+  return journey.data;
+}
+
+function renderJourney() {
+  const d = journey.data;
+  const cur = d.current_day;
+  const finished = cur > J_TOTAL;
+  const done = Math.min(cur - 1, J_TOTAL);
+  $('#journeyLabel').textContent = finished ? 'All 7 days complete 🏆' : `Day ${cur} of ${J_TOTAL}`;
+  $('#journeyPct').textContent = `${Math.round((done / J_TOTAL) * 100)}%`;
+  $('#journeyBar').style.width = `${(done / J_TOTAL) * 100}%`;
+
+  const height = jY(J_TOTAL - 1) + 90;
+  $('#journeyMap').style.height = `${height}px`;
+  // Dotted path: one cubic segment per pair of days, coloured by what it leads to
+  const svg = $('#journeyPath');
+  svg.setAttribute('viewBox', `0 0 100 ${height}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.innerHTML = d.days.slice(0, -1).map((_, i) => {
+    const [x1, y1, x2, y2] = [J_X[i], jY(i), J_X[i + 1], jY(i + 1)];
+    const mid = (y2 - y1) / 2;
+    const to = journeyState(i + 2, cur);
+    const cls = to === 'done' || to === 'active' ? 'seg-done' : to === 'next' ? 'seg-next' : 'seg-locked';
+    return `<path class="${cls}" d="M${x1} ${y1} C${x1} ${y1 + mid}, ${x2} ${y2 - mid}, ${x2} ${y2}"/>`;
+  }).join('');
+
+  $('#journeyNodes').innerHTML = d.days.map((day, i) => {
+    const st = journeyState(day.day, cur);
+    const face = st === 'done' ? '✓' : st === 'active' ? day.emoji : st === 'next' ? day.day : '🔒';
+    const label = st === 'locked' ? `Day ${day.day}` : `Day ${day.day} · ${day.title}`;
+    const cls = [`j-node j-${st}`, journey.sel === day.day ? 'j-sel' : '', journey.unlocked === day.day ? 'j-unlock' : ''].join(' ');
+    return `<button type="button" class="${cls}" data-jday="${day.day}" style="left:${J_X[i]}%; top:${jY(i)}px"
+      aria-label="Day ${day.day}: ${esc(day.title)} (${st === 'next' ? 'up next' : st})"><span class="j-orb">${face}</span><span class="j-label">${esc(label)}</span></button>`;
+  }).join('');
+  journey.unlocked = null;
+
+  const btn = $('#journeyComplete');
+  btn.disabled = finished || journey.busy;
+  btn.textContent = finished ? '🏆 Journey complete!' : journey.busy ? 'Saving…'
+    : cur === J_TOTAL ? `✅ Complete Day ${cur} & Finish` : `✅ Complete Day ${cur} & Unlock Next`;
+  renderJourneyPop();
+}
+
+// Meal card floating over the selected node (below it, or above for the last days)
+function renderJourneyPop() {
+  const pop = $('#journeyPop');
+  const day = journey.data?.days.find((x) => x.day === journey.sel);
+  if (!day) { pop.hidden = true; return; }
+  const i = day.day - 1;
+  const st = journeyState(day.day, journey.data.current_day);
+  pop.innerHTML = `<div class="flex items-center justify-between gap-2 mb-1">
+      <p class="font-bold text-gray-900">${day.emoji} Day ${day.day}: ${esc(day.title)}</p>
+      <span class="text-[0.65rem] font-bold uppercase rounded-full px-2 py-0.5 ${st === 'done' ? 'bg-emerald-100 text-emerald-800' : st === 'active' ? 'bg-green-500 text-white' : 'bg-yellow-100 text-yellow-800'}">${st === 'done' ? 'Done' : st === 'active' ? 'Today' : 'Next'}</span>
+    </div>
+    ${Object.entries(day.meals).map(([k, v]) => `<div class="meal-row"><b>${esc(k)}</b><span class="text-gray-800">${esc(v)}</span></div>`).join('')}
+    <p class="text-[0.72rem] text-teal-800 bg-teal-50 rounded-lg px-2 py-1.5 mt-2">💡 ${esc(day.tip)}</p>`;
+  pop.hidden = false;
+  const W = $('#journeyMap').clientWidth;
+  const x = (J_X[i] / 100) * W;
+  const pw = Math.min(232, W - 16);
+  pop.style.width = `${pw}px`;
+  const left = Math.max(8, Math.min(W - pw - 8, x - pw / 2));
+  pop.style.left = `${left}px`;
+  pop.style.setProperty('--arrow', `${Math.max(18, Math.min(pw - 18, x - left))}px`);
+  const above = i >= J_TOTAL - 2;
+  const r = st === 'active' ? 50 : 44; // orb radius + gap
+  pop.classList.toggle('above', above);
+  pop.classList.toggle('below', !above);
+  if (above) { pop.style.top = ''; pop.style.bottom = `${$('#journeyMap').clientHeight - jY(i) + r}px`; } else { pop.style.bottom = ''; pop.style.top = `${jY(i) + r + 26}px`; }
+}
+
+function scrollToJourneyDay(day) {
+  const i = Math.min(day, J_TOTAL) - 1;
+  const box = $('#journeyScroll');
+  box.scrollTo({ top: Math.max(0, jY(i) - box.clientHeight / 3), behavior: 'smooth' });
+}
+
+async function openJourney() {
+  $('#journeyModal').hidden = false;
+  document.body.style.overflow = 'hidden';
+  if (state.guest) {
+    $('#journeyNodes').innerHTML = '<p class="text-center text-sm text-gray-500 pt-16 px-6">Sign in (or use a demo account) to start your 7-day journey and save progress.</p>';
+    $('#journeyPath').innerHTML = '';
+    $('#journeyPop').hidden = true;
+    $('#journeyComplete').disabled = true;
+    return;
+  }
+  if (!journey.data) {
+    $('#journeyNodes').innerHTML = '<p class="text-center text-sm text-gray-400 pt-16">Loading your roadmap…</p>';
+    await loadJourney();
+  }
+  if (!journey.data) {
+    $('#journeyNodes').innerHTML = '<p class="text-center text-sm text-red-600 pt-16">Could not load your journey. Try again shortly.</p>';
+    return;
+  }
+  journey.sel = Math.min(journey.data.current_day, J_TOTAL);
+  renderJourney();
+  scrollToJourneyDay(journey.sel);
+  $('#journeyClose').focus();
+}
+function closeJourney() {
+  $('#journeyModal').hidden = true;
+  document.body.style.overflow = '';
+}
+
+async function completeJourneyDay() {
+  const d = journey.data;
+  if (!d || journey.busy || d.current_day > J_TOTAL) return;
+  journey.busy = true;
+  renderJourney();
+  try {
+    const r = await post('/api/journey/complete', { day: d.current_day });
+    journey.data = r;
+    const cur = r.current_day;
+    journey.unlocked = cur <= J_TOTAL ? cur : null;
+    journey.sel = Math.min(cur, J_TOTAL);
+    toast(cur > J_TOTAL ? '🏆 You finished the 7-day journey!' : `🎉 Day ${cur - 1} complete — Day ${cur} unlocked!`);
+  } catch (e) {
+    toast(`⚠️ ${e.message}`);
+    await loadJourney(); // resync after a conflict (e.g. completed in another tab)
+  } finally {
+    journey.busy = false;
+  }
+  renderJourney();
+  renderJourneyCta();
+  scrollToJourneyDay(journey.sel);
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-journey]')) { openJourney(); return; }
+  if ($('#journeyModal').hidden) return;
+  const node = e.target.closest('[data-jday]');
+  if (node) {
+    const day = Number(node.dataset.jday);
+    if (journeyState(day, journey.data.current_day) === 'locked') {
+      toast(`🔒 Complete Day ${Math.min(journey.data.current_day + 1, J_TOTAL)} to unlock Day ${day}`);
+      return;
+    }
+    journey.sel = journey.sel === day ? null : day;
+    renderJourney();
+    return;
+  }
+  if (e.target === $('#journeyModal')) { closeJourney(); return; }
+  if (e.target.closest('#journeyMap') && !e.target.closest('#journeyPop')) { journey.sel = null; renderJourney(); }
+});
+$('#journeyClose').addEventListener('click', closeJourney);
+$('#journeyComplete').addEventListener('click', completeJourneyDay);
+// Escape closes the roadmap first (capture phase, so the sheet's Escape handler doesn't also fire)
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('#journeyModal').hidden) { e.stopPropagation(); closeJourney(); }
+}, true);
+window.addEventListener('resize', () => { if (!$('#journeyModal').hidden && journey.data) renderJourneyPop(); });
 $('#chatForm').addEventListener('submit', (e) => {
   e.preventDefault();
   const text = $('#chatInput').value.trim();

@@ -23,7 +23,7 @@ async function main() {
     client.release();
   }
   const s = await db.stats();
-  console.log(`[initDB] Schema ready on ${db.getPath()} — ${s.users} users, ${s.meal_logs} meal logs, ${s.chat_messages} chat messages`);
+  console.log(`[initDB] Schema ready on ${db.getPath()} — ${s.users} users, ${s.meal_logs} meal logs, ${s.chat_messages} chat messages, ${s.journeys} journey rows`);
 }
 
 main()

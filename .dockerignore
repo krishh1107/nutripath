@@ -13,4 +13,5 @@ README.md
 *.log
 .vscode
 .idea
-data
+data/*
+!data/nutrition_kb.json

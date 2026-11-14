@@ -10,6 +10,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY server.js db.js initDB.js loadEnv.js auth.js mailer.js data.js schema.sql ./
 COPY public ./public
+COPY --chown=node:node data/nutrition_kb.json ./data/
 
 # Run as the unprivileged "node" user that ships with the image
 USER node

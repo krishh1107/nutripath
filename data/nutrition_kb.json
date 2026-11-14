@@ -1,0 +1,153 @@
+{
+  "version": "1.0.0",
+  "scope": "Clinical nutrition rules for Indian students, hostel/PG residents and young adults. Educational guidance, not a medical diagnosis.",
+  "synergies": [
+    {
+      "id": "vitc_iron",
+      "pair": ["Vitamin C", "Non-heme iron"],
+      "rule": "Vitamin C + Iron = up to 3x absorption. Vitamin C converts ferric iron to the more absorbable ferrous form.",
+      "how": "Squeeze half a lemon on dal, rajma, chana or palak; eat a guava or amla with poha or sprouts.",
+      "foods": ["lemon", "amla", "guava", "orange", "tomato", "capsicum"],
+      "keywords": ["iron", "anaemia", "anemia", "hemoglobin", "haemoglobin", "palak", "spinach", "lemon", "vitamin c"]
+    },
+    {
+      "id": "turmeric_pepper",
+      "pair": ["Curcumin (haldi)", "Piperine (black pepper)"],
+      "rule": "A pinch of black pepper raises curcumin absorption roughly 20x (piperine slows its breakdown).",
+      "how": "Add a pinch of kali mirch to haldi doodh or any haldi-based sabzi; fat (ghee/milk) helps further.",
+      "foods": ["turmeric", "black pepper", "milk", "ghee"],
+      "keywords": ["turmeric", "haldi", "inflammation", "pepper", "curcumin"]
+    },
+    {
+      "id": "fat_soluble_vitamins",
+      "pair": ["Vitamins A, D, E, K", "Dietary fat"],
+      "rule": "Fat-soluble vitamins need fat to be absorbed. A low-fat meal can cut beta-carotene and Vitamin D uptake sharply.",
+      "how": "Take Vitamin D with the main meal; cook carrots/greens with 1 tsp ghee or oil.",
+      "foods": ["ghee", "groundnuts", "curd", "eggs", "carrot", "palak"],
+      "keywords": ["vitamin d", "vitamin a", "carrot", "fat", "sunlight", "supplement"]
+    },
+    {
+      "id": "cereal_pulse",
+      "pair": ["Cereals (rice, roti)", "Pulses (dal, rajma, chana)"],
+      "rule": "Cereals are low in lysine, pulses are low in methionine; together they form a complete protein.",
+      "how": "Dal-chawal, rajma-chawal, khichdi, idli-sambar — aim for roughly 1 part dal to 2-3 parts cereal.",
+      "foods": ["rice", "roti", "dal", "rajma", "chana", "moong"],
+      "keywords": ["protein", "vegetarian", "vegan", "dal", "khichdi", "complete protein", "amino"]
+    },
+    {
+      "id": "fermentation",
+      "pair": ["Fermentation", "B-vitamins and minerals"],
+      "rule": "Fermenting (idli/dosa batter, curd, kanji) reduces phytates and raises B-vitamin and mineral availability.",
+      "how": "Prefer fermented breakfasts; overnight-soaked or sprouted moong also cuts phytates.",
+      "foods": ["idli", "dosa", "curd", "kanji", "sprouts"],
+      "keywords": ["gut", "digestion", "probiotic", "curd", "sprouts", "phytate"]
+    },
+    {
+      "id": "calcium_vitd",
+      "pair": ["Calcium", "Vitamin D"],
+      "rule": "Vitamin D is required for intestinal calcium absorption; low D makes dairy calcium far less useful.",
+      "how": "15-20 minutes of midday sun on arms; pair with curd, paneer, ragi.",
+      "foods": ["ragi", "curd", "paneer", "milk", "sesame"],
+      "keywords": ["calcium", "bones", "vitamin d", "ragi", "milk"]
+    }
+  ],
+  "blockers": [
+    {
+      "id": "chai_iron",
+      "blocker": "Tannins in chai / coffee",
+      "blocks": "Non-heme iron",
+      "rule": "Tannins in Chai block Iron — tea with a meal can cut non-heme iron absorption by 60% or more.",
+      "fix": "Keep chai/coffee at least 45-60 minutes away from iron-rich meals; never drink chai with poha, dal or palak.",
+      "keywords": ["chai", "tea", "coffee", "iron", "anaemia", "anemia", "breakfast"]
+    },
+    {
+      "id": "calcium_iron",
+      "blocker": "Calcium (milk, curd, paneer, calcium tablets)",
+      "blocks": "Iron",
+      "rule": "Calcium competes with iron for absorption when eaten in the same meal.",
+      "fix": "Separate iron tablets or iron-rich meals from milk/calcium supplements by about 2 hours.",
+      "keywords": ["calcium", "milk", "iron", "supplement", "tablet"]
+    },
+    {
+      "id": "phytates",
+      "blocker": "Phytates in unsoaked whole grains, bran and legumes",
+      "blocks": "Iron, zinc, calcium",
+      "rule": "Phytic acid binds minerals and lowers their absorption.",
+      "fix": "Soak dals and rajma 6-8 hours, sprout moong/chana, or ferment batters.",
+      "keywords": ["zinc", "iron", "rajma", "chana", "whole grain", "soak", "sprout"]
+    },
+    {
+      "id": "oxalates",
+      "blocker": "Oxalates in palak (spinach)",
+      "blocks": "Calcium and iron from the same leaf",
+      "rule": "Palak's oxalates bind most of its own calcium and iron, so palak alone is a weak iron source.",
+      "fix": "Blanch palak and add lemon; rely on rajma, chana, til, jaggery-with-lemon, or eggs/meat for iron too.",
+      "keywords": ["palak", "spinach", "iron", "calcium", "anaemia"]
+    },
+    {
+      "id": "ppi_b12",
+      "blocker": "Antacids / PPIs (pantoprazole, omeprazole) and metformin",
+      "blocks": "Vitamin B12 (and iron for PPIs)",
+      "rule": "Long-term acid suppression and metformin lower B12 absorption.",
+      "fix": "Ask the doctor about a B12 test if on these for more than a few months; vegetarians are at extra risk.",
+      "keywords": ["b12", "metformin", "pantoprazole", "omeprazole", "antacid", "acidity", "medication"]
+    },
+    {
+      "id": "caffeine_calcium",
+      "blocker": "Excess caffeine (more than 3-4 cups/day)",
+      "blocks": "Calcium retention and sleep quality",
+      "rule": "High caffeine raises urinary calcium loss and disrupts sleep, which worsens appetite control.",
+      "fix": "Cap at 2-3 cups a day and none after 4 PM.",
+      "keywords": ["coffee", "caffeine", "sleep", "exam", "energy drink"]
+    }
+  ],
+  "hostel_constraints": [
+    {
+      "id": "kettle_only",
+      "constraint": "Kettle only, no cooking",
+      "rule": "Assume only an electric kettle and hot water. Never suggest frying, pressure-cooking, baking or a stove.",
+      "options": [
+        "Soya chunks soaked 10 min in kettle-hot water, squeezed, with lemon and chaat masala (~26 g protein per 50 g, about Rs 12)",
+        "Eggs boiled in the kettle for 12 minutes (about 6 g protein each)",
+        "Instant oats or poha softened with hot water, topped with peanuts",
+        "Sattu shake: 40 g sattu + water + lemon + salt (~8 g protein, about Rs 8)",
+        "Sprouted moong chaat with tomato, onion and lemon (no cooking needed)"
+      ],
+      "keywords": ["hostel", "kettle", "pg", "no kitchen", "room", "dorm", "cook"]
+    },
+    {
+      "id": "no_fridge",
+      "constraint": "No refrigerator",
+      "rule": "Prefer shelf-stable foods: roasted chana, peanuts, makhana, sattu, oats, bananas, guava, peanut chikki. Buy curd daily in small packs.",
+      "options": ["Roasted chana", "Makhana", "Peanut chikki", "Bananas", "Sattu"],
+      "keywords": ["fridge", "storage", "snack", "shelf"]
+    },
+    {
+      "id": "mess_food",
+      "constraint": "Fixed mess menu",
+      "rule": "Optimise within the mess: take extra dal or curd, fill half the plate with sabzi, limit the second helping of rice, ask for lemon.",
+      "options": ["Double dal, single rice", "Curd with lunch", "Lemon on dal", "Skip fried snack, add fruit"],
+      "keywords": ["mess", "canteen", "hostel food", "thali"]
+    },
+    {
+      "id": "budget",
+      "constraint": "Student budget (about Rs 2000-4000 per month extra food spend)",
+      "rule": "Cheapest protein per rupee: soya chunks, eggs, sattu, chana, peanuts, curd. Avoid whey and imported foods unless the budget allows.",
+      "options": ["Soya chunks", "Eggs", "Sattu", "Roasted chana", "Peanuts", "Curd"],
+      "keywords": ["budget", "cheap", "money", "afford", "cost", "rupee", "whey"]
+    }
+  ],
+  "condition_rules": [
+    { "id": "diabetes", "rule": "Low-GI swaps: millets or brown rice for white rice, besan/bajra roti for maida, whole fruit not juice; protein at every meal; 10-15 min walk after meals.", "keywords": ["diabetes", "sugar", "glucose", "insulin", "gi"] },
+    { "id": "pcos", "rule": "Insulin-friendly plate: protein + fibre first, carbs last; include seeds (flax, pumpkin); limit sugary drinks.", "keywords": ["pcos", "pcod", "periods", "hormone"] },
+    { "id": "hypertension", "rule": "Keep salt under 5 g/day; avoid pickles, papad and namkeen; add potassium from banana, coconut water, dal.", "keywords": ["bp", "blood pressure", "hypertension", "salt"] },
+    { "id": "fever_recovery", "rule": "Days 1-3: ORS, coconut water, kanji, dal water. Days 4-7: moong dal khichdi, curd rice. Days 8-14: dal-roti, paneer/eggs to rebuild. See a doctor if fever lasts more than 3 days or any bleeding appears.", "keywords": ["fever", "dengue", "viral", "cold", "flu", "recovery"] },
+    { "id": "food_poisoning", "rule": "First 6-24 h: ORS sips and rest; then banana, rice kanji, curd rice, toast; avoid dairy-heavy, fried and spicy food for 3-5 days.", "keywords": ["food poisoning", "loose motion", "diarrhoea", "diarrhea", "vomit", "stomach"] }
+  ],
+  "safety": [
+    "NutriPath AI is not a doctor: do not diagnose or prescribe medicine doses.",
+    "Red flags (chest pain, fainting, bleeding, fever above 3 days, severe dehydration, dengue warning signs) require immediate medical care.",
+    "Always respect the user's stated allergies and diet type.",
+    "Recommend blood tests (CBC, ferritin, B12, Vitamin D) before suggesting high-dose supplements."
+  ]
+}

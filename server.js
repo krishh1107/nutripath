@@ -7,6 +7,8 @@ const db = require('./db');
 const auth = require('./auth');
 const mailer = require('./mailer');
 const { FOODS, SUPPLEMENTS, SUPPLEMENT_WARNINGS } = require('./data');
+// Clinical knowledge base grounding the AI chat (synergies, blockers, hostel constraints)
+const NUTRITION_KB = require('./data/nutrition_kb.json');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -60,20 +62,34 @@ function sessionPayload(user, isNew) {
   return { token: auth.signSession(user.id), user, isNew, needsOnboarding: !user.onboarded };
 }
 
-// Google sign-in: exchange a Firebase ID token for an app session; upserts the users row
-app.post('/api/auth/login', h(async (req, res) => {
+// Inserts/updates the users row (plus health_profiles + journey_progress). A database failure
+// is logged with the real Postgres reason and returned as a readable 503, never a bare 500.
+async function upsertForLogin(res, fields) {
+  try {
+    return await db.upsertUser(fields);
+  } catch (err) {
+    console.error('[login] user upsert failed:', db.describeError(err), err.code ? `(pg ${err.code})` : '');
+    res.status(503).json({ error: 'Could not save your account — the database is unavailable. Try again shortly.' });
+    return null;
+  }
+}
+
+async function googleLogin(req, res) {
   let claims;
   try {
     claims = await auth.verifyFirebaseIdToken(req.body?.idToken);
   } catch (err) {
     return res.status(401).json({ error: `Sign-in failed: ${err.message}` });
   }
-  const { user, isNew } = await db.upsertUser({
-    firebase_uid: claims.sub, email: claims.email, name: claims.name || claims.email?.split('@')[0],
-    photo_url: claims.picture, provider: 'google',
+  const result = await upsertForLogin(res, {
+    firebase_uid: claims.sub, email: claims.email || null, name: claims.name || claims.email?.split('@')[0] || 'Friend',
+    photo_url: claims.picture || null, provider: 'google',
   });
-  res.json(sessionPayload(user, isNew));
-}));
+  if (result) res.json(sessionPayload(result.user, result.isNew));
+}
+
+// Google sign-in: exchange a Firebase ID token for an app session; upserts the users row
+app.post('/api/auth/login', h(googleLogin));
 
 // Demo sign-in (only when Firebase is not configured, or ALLOW_DEMO_LOGIN=true)
 async function demoLogin(req, res) {
@@ -82,35 +98,16 @@ async function demoLogin(req, res) {
   const email = String(req.body?.email || '').trim().toLowerCase().slice(0, 200);
   if (!name && !email) return res.status(400).json({ error: 'Name is required' });
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Email looks invalid' });
-  let result;
-  try {
-    result = await db.upsertUser({
-      firebase_uid: `demo:${email || name.toLowerCase()}`, email: email || null, name: name || email.split('@')[0], provider: 'demo',
-    });
-  } catch (err) {
-    console.error('[login] user upsert failed:', db.describeError(err));
-    return res.status(503).json({ error: 'Could not save your account — the database is unreachable. Try again shortly.' });
-  }
-  res.json(sessionPayload(result.user, result.isNew));
+  const result = await upsertForLogin(res, {
+    firebase_uid: `demo:${email || name.toLowerCase()}`, email: email || null, name: name || email.split('@')[0], photo_url: null, provider: 'demo',
+  });
+  if (result) res.json(sessionPayload(result.user, result.isNew));
 }
 app.post('/api/auth/demo', h(demoLogin));
 
 // Unified login: { idToken } → Google/Firebase sign-in, otherwise { name, email } → demo sign-in.
 // Inserts the users row on first login and returns { token, user, isNew, needsOnboarding }.
-app.post('/api/login', h(async (req, res) => {
-  if (!req.body?.idToken) return demoLogin(req, res);
-  let claims;
-  try {
-    claims = await auth.verifyFirebaseIdToken(req.body.idToken);
-  } catch (err) {
-    return res.status(401).json({ error: `Sign-in failed: ${err.message}` });
-  }
-  const { user, isNew } = await db.upsertUser({
-    firebase_uid: claims.sub, email: claims.email, name: claims.name || claims.email?.split('@')[0],
-    photo_url: claims.picture, provider: 'google',
-  });
-  res.json(sessionPayload(user, isNew));
-}));
+app.post('/api/login', h((req, res) => (req.body?.idToken ? googleLogin(req, res) : demoLogin(req, res))));
 
 // Everything below requires a session
 app.use('/api', auth.requireAuth(db));
@@ -1298,7 +1295,30 @@ Safety rules:
 
 Style: warm, concise, practical. Use short bullet points, give quantities in Indian household measures (katori, roti, glass) and approximate rupee cost when helpful.`;
 
+// Grounding prompt for Gemini: the whole knowledge base (it is small) is injected as context
+const KB_PROMPT = 'You are NutriPath AI. Base ALL answers strictly on this JSON context. Always point out food synergies and blockers.\n'
+  + 'If the JSON context does not cover a question, say so briefly and give only general, safe guidance. '
+  + 'Never mention the JSON itself or its ids/keys to the user; just apply the rules.\n\n'
+  + `<nutrition_kb>\n${JSON.stringify(NUTRITION_KB)}\n</nutrition_kb>\n\n`;
+
+// Offline retrieval: KB entries whose keywords appear in the message, best matches first
+const KB_ENTRIES = [
+  ...NUTRITION_KB.synergies.map((e) => ({ ...e, kind: 'Synergy', text: `${e.rule} ${e.how}` })),
+  ...NUTRITION_KB.blockers.map((e) => ({ ...e, kind: 'Blocker', text: `${e.rule} Fix: ${e.fix}` })),
+  ...NUTRITION_KB.hostel_constraints.map((e) => ({ ...e, kind: 'Hostel', text: `${e.constraint}: ${e.rule}` })),
+  ...NUTRITION_KB.condition_rules.map((e) => ({ ...e, kind: 'Condition', text: e.rule })),
+];
+function kbMatches(message, limit = 3) {
+  const m = message.toLowerCase();
+  return KB_ENTRIES.map((e) => ({ e, score: e.keywords.filter((k) => m.includes(k)).length }))
+    .filter((x) => x.score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map((x) => x.e);
+}
+
 function offlineReply(message) {
+  const hits = kbMatches(message);
+  if (hits.length) {
+    return `Here's what the NutriPath knowledge base says:\n\n${hits.map((e) => `- **${e.kind}:** ${e.text}`).join('\n')}\n\n_Offline mode — answers come straight from the clinical rules._`;
+  }
   const m = message.toLowerCase();
   if (/iron|chai|tea|anaem|anem/.test(m)) return 'Chai-Time Iron Blocker: tannins in tea cut iron absorption. Keep chai at least 45 minutes away from meals, and add lemon to your dal/sabzi (the Lemon Hack) to boost iron uptake.';
   if (/protein|whey|kettle|hostel/.test(m)) return 'Kettle-only protein: soak 50 g soya chunks in kettle-hot water for 10 min (~26 g protein, ₹12), boil 3 eggs in the kettle (~19 g), and drink a sattu shake (40 g sattu ≈ 8 g protein for ₹8).';
@@ -1321,7 +1341,7 @@ app.post('/api/chat', h(async (req, res) => {
       const context = `\n\nCurrent user: ${req.user.name}, ${p.age}y ${p.sex}, ${p.weight_kg} kg, ${p.diet_type}, goal ${p.goal}, lives in ${p.living_setup} with appliances: ${p.appliances.join(', ') || 'none'}; `
         + `budget ₹${p.monthly_food_budget || '?'}/month; allergies: ${p.allergies.join(', ') || 'none'}; conditions: ${p.conditions.join(', ') || 'none'}; `
         + `daily target ${p.daily_calorie_target} kcal; eaten today ${t.calories} kcal (${t.protein_g} g protein).`;
-      const model = genAI.getGenerativeModel({ model: CHAT_MODEL, systemInstruction: SYSTEM_PROMPT + context }, AI_TIMEOUT);
+      const model = genAI.getGenerativeModel({ model: CHAT_MODEL, systemInstruction: KB_PROMPT + SYSTEM_PROMPT + context }, AI_TIMEOUT);
       const history = (await db.getChatHistory(uid, 20)).slice(0, -1).map((x) => ({ role: x.role, parts: [{ text: x.message }] }));
       while (history.length && history[0].role !== 'user') history.shift();
       reply = (await model.startChat({ history }).sendMessage(message)).response.text();
@@ -1335,6 +1355,36 @@ app.post('/api/chat', h(async (req, res) => {
   }
   await db.addChatMessage(uid, 'model', reply);
   res.json({ reply, source });
+}));
+
+// ===========================================================================
+// MY JOURNEY — gamified 7-day roadmap (journey_progress.current_day; 8 = finished)
+// ===========================================================================
+const JOURNEY_DAYS = [
+  { day: 1, title: 'Fix your plate', emoji: '🌱', meals: { Morning: 'Poha with peanuts + lemon', Lunch: 'Dal & Roti + salad', Dinner: 'Moong dal Khichdi + curd' }, tip: 'Squeeze lemon on poha — Vitamin C triples iron absorption.' },
+  { day: 2, title: 'Protein power', emoji: '💪', meals: { Morning: 'Sattu shake + banana', Lunch: 'Rajma chawal + cucumber', Dinner: 'Paneer bhurji + 2 roti' }, tip: 'Dal + rice together make a complete protein.' },
+  { day: 3, title: 'Iron day', emoji: '🩸', meals: { Morning: 'Sprouted moong chaat', Lunch: 'Chana masala + roti + lemon', Dinner: 'Palak dal + jeera rice' }, tip: 'Keep chai 45 minutes away from meals — tannins block iron.' },
+  { day: 4, title: 'Kettle hacks', emoji: '☕', meals: { Morning: 'Instant oats + peanuts', Lunch: 'Mess thali: double dal, single rice', Dinner: 'Soaked soya chunk chaat' }, tip: 'Soya chunks in kettle-hot water: ~26 g protein for ₹12.' },
+  { day: 5, title: 'Gut reset', emoji: '🥣', meals: { Morning: 'Idli + sambar', Lunch: 'Curd rice + sabzi', Dinner: 'Vegetable daliya' }, tip: 'Fermented foods cut phytates and add B-vitamins.' },
+  { day: 6, title: 'Smart snacking', emoji: '🥜', meals: { Morning: 'Besan chilla + mint chutney', Lunch: 'Dal, sabzi, 2 roti + guava', Dinner: 'Egg or paneer curry + roti' }, tip: 'Swap namkeen for roasted chana or makhana.' },
+  { day: 7, title: 'Make it a habit', emoji: '🏆', meals: { Morning: 'Ragi dosa + chutney', Lunch: 'Rajma + brown rice', Dinner: 'Moong dal khichdi + haldi doodh' }, tip: 'A pinch of black pepper boosts haldi absorption ~20x.' },
+];
+const journeyPayload = (row) => ({
+  current_day: row.current_day, completed: row.current_day > JOURNEY_DAYS.length, updated_at: row.updated_at, days: JOURNEY_DAYS,
+});
+
+app.get('/api/journey', h(async (req, res) => res.json(journeyPayload(await db.getJourney(req.user.id)))));
+
+// Body { day } (optional): the day being completed; defaults to the current day.
+// Only the current day can be completed, so a double tap never skips ahead.
+app.post('/api/journey/complete', h(async (req, res) => {
+  const current = (await db.getJourney(req.user.id)).current_day;
+  if (current > JOURNEY_DAYS.length) return res.json({ ...journeyPayload({ current_day: current }), advanced: false });
+  const day = req.body?.day === undefined ? current : Number(req.body.day);
+  if (!Number.isInteger(day) || day < 1 || day > JOURNEY_DAYS.length) return res.status(400).json({ error: 'day must be 1–7' });
+  if (day !== current) return res.status(409).json({ error: `Day ${current} is your current day — complete it first.`, current_day: current });
+  const row = await db.completeJourneyDay(req.user.id, day);
+  res.json({ ...journeyPayload(row), advanced: row.advanced });
 }));
 
 app.get('/api/chat/history', async (req, res) => res.json({ messages: await db.getChatHistory(req.user.id, 40) }));

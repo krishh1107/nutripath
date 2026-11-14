@@ -112,6 +112,7 @@ const db = {
       [firebase_uid, email ?? null, name || 'Friend', photo_url ?? null, provider || 'google'],
     );
     await query('INSERT INTO health_profiles (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING', [row.id]);
+    await query('INSERT INTO journey_progress (user_id, current_day) VALUES ($1, 1) ON CONFLICT (user_id) DO NOTHING', [row.id]);
     const { inserted, ...user } = row;
     return { user, isNew: inserted };
   },
@@ -230,12 +231,30 @@ const db = {
   },
   resetRecovery: (userId, plan) => query('DELETE FROM recovery_checks WHERE user_id = $1 AND plan = $2', [userId, plan]),
 
+  // ----- journey_progress ("My Journey" 7-day roadmap; current_day 8 = finished) -----
+  async getJourney(userId) {
+    const row = await one(
+      `INSERT INTO journey_progress (user_id, current_day) VALUES ($1, 1)
+       ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id RETURNING current_day, updated_at`, [userId],
+    );
+    return row;
+  },
+  // Advances only if `day` is the user's current day, so a double-click can't skip a day
+  async completeJourneyDay(userId, day) {
+    await db.getJourney(userId);
+    const row = await one(
+      `UPDATE journey_progress SET current_day = LEAST(current_day + 1, 8), updated_at = ${NOW}
+       WHERE user_id = $1 AND current_day = $2 AND current_day < 8 RETURNING current_day, updated_at`, [userId, day],
+    );
+    return { advanced: Boolean(row), ...(row || (await db.getJourney(userId))) };
+  },
+
   // ----- email_log -----
   logEmail: (userId, kind, to, status, detail) => query('INSERT INTO email_log (user_id, kind, to_addr, status, detail) VALUES ($1, $2, $3, $4, $5)',
     [userId, kind, to, status, detail ?? null]),
 
   stats: () => one(`SELECT (SELECT COUNT(*) FROM users)::int AS users, (SELECT COUNT(*) FROM meal_logs)::int AS meal_logs,
-    (SELECT COUNT(*) FROM chatbot_history)::int AS chat_messages`),
+    (SELECT COUNT(*) FROM chatbot_history)::int AS chat_messages, (SELECT COUNT(*) FROM journey_progress)::int AS journeys`),
 };
 
 module.exports = db;
